@@ -1,0 +1,10 @@
+{
+  "name": "smart-blackboard-server",
+  "version": "2.0.0",
+  "private": true,
+  "description": "স্মার্ট ব্ল্যাকবোর্ড — রুম সার্ভার ও স্ট্যাটিক হোস্ট (কোনো নির্ভরতা নেই)",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED"
+}
