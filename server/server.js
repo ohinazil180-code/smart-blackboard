@@ -1,20 +1,24 @@
 'use strict';
 /* =====================================================================
-   স্মার্ট ব্ল্যাকবোর্ড — রুম সার্ভার (কোনো লগইন নেই)
-   - শুধু Node.js বিল্ট-ইন মডিউল, কোনো npm নির্ভরতা নেই
+   স্মার্ট ব্ল্যাকবোর্ড — রুম সার্ভার
    - স্ট্যাটিক ফ্রন্টএন্ড এবং /api রুট একসাথে সার্ভ করে
    - রিয়েল-টাইম আপডেট: Server-Sent Events (SSE)
-   - ডেটা: JSON ফাইলে নিয়মিত সংরক্ষণ (DATA_FILE)
+   - রুম ডেটা Neon-এ সংরক্ষিত; টেস্টে JSON ফাইল ব্যবহার হয়
    ===================================================================== */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { and, eq, gt, lte, or, sql } = require('drizzle-orm');
+require('dotenv').config({ path: path.join(__dirname, '.env.development.local'), quiet: true });
+require('dotenv').config({ path: path.join(__dirname, '..', '.env.development.local'), quiet: true });
 
 const PORT = parseInt(process.env.PORT, 10) || 8080;
+const useDatabase = Boolean(process.env.DATABASE_URL && process.env.NODE_ENV !== 'test');
+const database = useDatabase ? require('./database') : null;
 const ROOT = path.resolve(__dirname, '..');
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'rooms.json');
-const ROOM_TTL_MS = 7 * 24 * 3600 * 1000;   // ৭ দিন নিষ্ক্রিয় থাকলে রুম মুছে যাবে
+const ROOM_TTL_MS = 7 * 24 * 3600 * 1000;   // ৭ দিন নিষ্ক্রিয় থাকলে রুমের মেয়াদ শেষ হয়
 const MAX_BODY = 16 * 1024;
 const MAX_BOARD = 6 * 1024 * 1024;      // বোর্ড পেজ স্ন্যাপশটের সীমা (PDF ব্যাকগ্রাউন্ডসহ)
 const MAX_ROOMS = 20000;
@@ -24,8 +28,17 @@ const CODE_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // অস্পষ্ট 
 
 const rooms = new Map();      // code -> room
 const streams = new Map();    // code -> Set<{res, memberId}>
+const streamTickets = new Map();
+let authVerifierPromise = null;
 const rateBuckets = new Map(); // ip:bucket -> {n, reset}
 const joinFails = new Map();   // ip -> {n, reset}
+const SECURITY_HEADERS = Object.freeze({
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'X-Frame-Options': 'DENY',
+  'Strict-Transport-Security': 'max-age=63072000',
+  'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=()'
+});
 
 /* ---------- ডেটা ---------- */
 function ensureMicState(room) {
@@ -42,7 +55,76 @@ function revokeMic(room, memberId, status = 'revoked') {
   const member = room.members.find(item => item.id === memberId);
   if (member) member.micStatus = status;
 }
-function loadData() {
+function databaseValues(room) {
+  const owner = room.members.find(member => member.id === room.ownerId);
+  const memberIds = [...new Set(room.members.map(member => member.userId).filter(Boolean))];
+  return {
+    code: room.code,
+    ownerId: owner?.userId || null,
+    memberIds,
+    state: room,
+    createdAt: new Date(room.createdAt || room.updatedAt || now()),
+    updatedAt: new Date(room.updatedAt || now()),
+    expiresAt: new Date((room.updatedAt || now()) + ROOM_TTL_MS)
+  };
+}
+function roomFromRow(row) {
+  if (!row) return null;
+  const room = row.state;
+  room.updatedAt = row.updatedAt.getTime();
+  ensureMicState(room);
+  return room;
+}
+function roomScope(code, userId) {
+  const table = database.classroomRooms;
+  return and(
+    eq(table.code, code),
+    or(eq(table.ownerId, userId), sql`${table.memberIds} @> ARRAY[${userId}::uuid]`),
+    gt(table.expiresAt, new Date())
+  );
+}
+async function loadRoomForUser(code, userId) {
+  if (!database) return rooms.get(code) || null;
+  const [row] = await database.db.select().from(database.classroomRooms).where(roomScope(code, userId)).limit(1);
+  const room = roomFromRow(row);
+  if (room) rooms.set(code, room);
+  return room;
+}
+async function loadRoomByInvite(code) {
+  if (!database) return rooms.get(code) || null;
+  const table = database.classroomRooms;
+  const [row] = await database.db.select().from(table).where(and(eq(table.code, code), gt(table.expiresAt, new Date()))).limit(1);
+  const room = roomFromRow(row);
+  if (room) rooms.set(code, room);
+  return room;
+}
+async function insertRoom(room) {
+  if (!database) return true;
+  const result = await database.db.insert(database.classroomRooms).values(databaseValues(room)).onConflictDoNothing({ target: database.classroomRooms.code }).returning({ code: database.classroomRooms.code });
+  return result.length > 0;
+}
+async function persistRoom(room, userId, viaInvite = false) {
+  if (!database) return;
+  const table = database.classroomRooms;
+  const scope = viaInvite ? eq(table.code, room.code) : roomScope(room.code, userId);
+  const result = await database.db.update(table).set(databaseValues(room)).where(scope).returning({ code: table.code });
+  if (!result.length) throw Object.assign(new Error('রুমটি আর পাওয়া যাচ্ছে না।'), { status: 404 });
+}
+async function loadData() {
+  if (database) {
+    const table = database.classroomRooms;
+    const existing = await database.db.select({ code: table.code }).from(table).limit(1);
+    if (!existing.length && fs.existsSync(DATA_FILE)) {
+      const legacy = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      const values = (legacy.rooms || []).filter(room => room && room.code && room.members && Array.isArray(room.members)).map(room => {
+        ensureMicState(room);
+        return databaseValues(room);
+      });
+      if (values.length) await database.db.insert(table).values(values).onConflictDoNothing({ target: table.code });
+      console.log(`[data] ${values.length} টি পুরোনো রুম Neon-এ কপি হয়েছে`);
+    }
+    return;
+  }
   try {
     const j = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     for (const r of j.rooms || []) if (r && r.code) { ensureMicState(r); rooms.set(r.code, r); }
@@ -50,9 +132,9 @@ function loadData() {
   } catch (_) { /* প্রথমবার চালু — ফাইল নেই */ }
 }
 let dirty = false;
-function markDirty() { dirty = true; }
+function markDirty() { if (!database) dirty = true; }
 function persist() {
-  if (!dirty) return;
+  if (database || !dirty) return;
   dirty = false;
   try {
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
@@ -63,8 +145,12 @@ function persist() {
 }
 setInterval(persist, 3000).unref();
 setInterval(() => {
-  const now = Date.now();
-  for (const [code, r] of rooms) if (now - r.updatedAt > ROOM_TTL_MS) { rooms.delete(code); streams.delete(code); markDirty(); }
+  const currentTime = Date.now();
+  for (const [code, room] of rooms) if (currentTime - room.updatedAt > ROOM_TTL_MS) { rooms.delete(code); streams.delete(code); markDirty(); }
+  if (database) {
+    database.db.delete(database.classroomRooms).where(lte(database.classroomRooms.expiresAt, new Date()))
+      .catch(error => console.error('[retention]', error.message));
+  }
 }, 3600 * 1000).unref();
 
 /* ---------- সহায়ক ---------- */
@@ -81,6 +167,37 @@ const clean = (s, max) => String(s == null ? '' : s).replace(/[\u0000-\u001f\u00
 const validRole = r => r === 'teacher' || r === 'student';
 const now = () => Date.now();
 function touch(room) { room.updatedAt = now(); markDirty(); }
+
+async function authenticate(req) {
+  const token = /^Bearer ([A-Za-z0-9._~-]+)$/.exec(req.headers.authorization || '')?.[1];
+  const baseUrl = process.env.NEON_AUTH_BASE_URL;
+  if (!token || !baseUrl) return null;
+  const jwksUrl = process.env.NEON_AUTH_JWKS_URL || `${baseUrl.replace(/\/+$/, '')}/.well-known/jwks.json`;
+  try {
+    if (!authVerifierPromise) {
+      authVerifierPromise = import('jose').then(({ createRemoteJWKSet, jwtVerify }) => ({
+        jwks: createRemoteJWKSet(new URL(jwksUrl)),
+        jwtVerify
+      }));
+    }
+    const { jwks, jwtVerify } = await authVerifierPromise;
+    const { payload } = await jwtVerify(token, jwks, { algorithms: ['EdDSA'] });
+    if (typeof payload.sub !== 'string' || payload.role !== 'authenticated') return null;
+    return { id: payload.sub, email: typeof payload.email === 'string' ? payload.email : null };
+  } catch (error) {
+    if (/^(JWT|JWS|JWKS|JOSE)/.test(error?.name || '')) return null;
+    console.error('[auth] verification unavailable:', error?.name || 'Error');
+    throw Object.assign(new Error('অ্যাকাউন্ট যাচাই করা যাচ্ছে না।'), { status: 503 });
+  }
+}
+function resolveRoomMember(room, userId, claimedMemberId) {
+  let member = room.members.find(item => item.userId === userId);
+  if (!member && claimedMemberId) {
+    member = room.members.find(item => item.id === claimedMemberId && !item.userId);
+    if (member) { member.userId = userId; touch(room); }
+  }
+  return member;
+}
 
 function clientIp(req) {
   // Reverse proxy (Netlify/Cloudflare/nginx) থেকে আসা IP
@@ -176,9 +293,9 @@ function send(res, status, obj) {
 const fail = (res, status, msg) => send(res, status, { error: msg });
 
 /* ---------- API ---------- */
-async function apiCreate(req, res, ip) {
+async function apiCreate(req, res, ip, user) {
   if (!rateOk(ip, 'create', 20, 3600e3)) return fail(res, 429, 'অনেক বেশি রুম তৈরি। কিছুক্ষণ পর চেষ্টা করুন।');
-  if (rooms.size >= MAX_ROOMS) return fail(res, 503, 'সার্ভার এখন পূর্ণ।');
+  if (!database && rooms.size >= MAX_ROOMS) return fail(res, 503, 'সার্ভার এখন পূর্ণ।');
   const b = await readJSON(req);
   const name = clean(b.name, 80), memberName = clean(b.memberName, 60) || 'শিক্ষক';
   if (!name) return fail(res, 400, 'রুমের নাম দিন।');
@@ -186,41 +303,65 @@ async function apiCreate(req, res, ip) {
   const room = {
     code: newCode(), name, status: 'live', ownerId, createdAt: now(), updatedAt: now(),
     groups: [{ id: rid(), name: 'গ্রুপ ১' }, { id: rid(), name: 'গ্রুপ ২' }],
-    members: [{ id: ownerId, name: memberName, role: 'teacher', groupId: null, joinedAt: now(), micStatus: 'idle' }],
+    members: [{ id: ownerId, userId: user.id, name: memberName, role: 'teacher', groupId: null, joinedAt: now(), micStatus: 'idle' }],
     mic: { queue: [], grant: null }
   };
-  rooms.set(room.code, room); touch(room);
+  touch(room);
+  let inserted = false;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    room.code = newCode();
+    if (await insertRoom(room)) { inserted = true; break; }
+  }
+  if (!inserted) return fail(res, 503, 'এখন রুম তৈরি করা যাচ্ছে না।');
+  rooms.set(room.code, room);
   send(res, 201, { memberId: ownerId, room: viewFor(room, ownerId) });
 }
 
-async function apiJoin(req, res, ip) {
+async function apiJoin(req, res, ip, user) {
   if (joinBlocked(ip)) return fail(res, 429, 'বারবার ভুল কোড দেওয়া হয়েছে। ১০ মিনিট পর চেষ্টা করুন।');
   if (!rateOk(ip, 'join', 60, 60e3)) return fail(res, 429, 'খুব দ্রুত অনুরোধ হচ্ছে।');
   const b = await readJSON(req);
   const code = clean(b.code, 16).toUpperCase().replace(/\s/g, '');
-  const room = rooms.get(code);
+  const room = await loadRoomByInvite(code);
   if (!room) { joinFailed(ip); return fail(res, 404, 'এই কোডের রুম পাওয়া যায়নি।'); }
   if (room.status === 'ended') return fail(res, 410, 'এই রুমটি শেষ হয়ে গেছে।');
-  const role = validRole(b.role) ? b.role : 'student';
   const name = clean(b.name, 60) || 'অজ্ঞাত';
-
-  // পুনরায় যোগ দেওয়া (একই ডিভাইস)
-  let member = b.memberId ? room.members.find(m => m.id === b.memberId) : null;
+  let member = resolveRoomMember(room, user.id, b.memberId);
   if (member) {
-    member.name = name; if (member.id !== room.ownerId) member.role = role;
+    member.name = name;
+    if (member.id !== room.ownerId) member.role = 'student';
   } else {
     if (room.members.length >= MAX_MEMBERS) return fail(res, 403, 'এই রুম পূর্ণ।');
-    member = { id: rid(), name, role, groupId: null, joinedAt: now() };
+    member = { id: rid(), userId: user.id, name, role: 'student', groupId: null, joinedAt: now(), micStatus: 'idle' };
     room.members.push(member);
   }
   if (b.groupId && room.groups.some(g => g.id === b.groupId)) member.groupId = b.groupId;
-  touch(room); broadcast(room);
+  touch(room);
+  await persistRoom(room, user.id, true);
+  broadcast(room);
   send(res, 200, { memberId: member.id, room: viewFor(room, member.id) });
 }
 
-function apiStream(req, res, code, memberId) {
-  const room = rooms.get(code);
-  if (!room || !room.members.some(m => m.id === memberId)) return fail(res, 403, 'সদস্য নন।');
+async function apiStreamTicket(req, res, code, user) {
+  const room = await loadRoomForUser(code, user.id);
+  if (!room) return fail(res, 404, 'রুম নেই।');
+  const b = await readJSON(req);
+  const member = resolveRoomMember(room, user.id, b.memberId);
+  if (!member) return fail(res, 403, 'সদস্য নন।');
+  const currentTime = now();
+  for (const [key, value] of streamTickets) if (value.expiresAt <= currentTime) streamTickets.delete(key);
+  const ticket = crypto.randomBytes(32).toString('base64url');
+  streamTickets.set(ticket, { code, memberId: member.id, userId: user.id, expiresAt: currentTime + 30_000 });
+  send(res, 200, { ticket, expiresAt: currentTime + 30_000 });
+}
+
+async function apiStream(req, res, code, ticket) {
+  const details = streamTickets.get(ticket);
+  streamTickets.delete(ticket);
+  if (!details || details.code !== code || details.expiresAt <= now()) return fail(res, 403, 'স্ট্রিম টিকিট মেয়াদোত্তীর্ণ।');
+  const { memberId, userId } = details;
+  const room = await loadRoomForUser(code, userId);
+  if (!room || !room.members.some(m => m.id === memberId && m.userId === userId)) return fail(res, 403, 'সদস্য নন।');
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -234,23 +375,23 @@ function apiStream(req, res, code, memberId) {
   res.write(`event: state\ndata: ${JSON.stringify(viewFor(room, memberId))}\n\n`);
   if (room.board) res.write(`event: board\ndata: ${JSON.stringify(room.board)}\n\n`);
   const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) { } }, 25000);
-  req.on('close', () => {
+  res.on('close', () => {
     clearInterval(hb);
     streams.get(code)?.delete(entry);
     if (room.mic?.grant?.memberId === memberId) {
       revokeMic(room, memberId);
       touch(room);
-      broadcast(room);
+      persistRoom(room, userId).then(() => broadcast(room)).catch(error => console.error('[persist]', error.message));
     }
   });
 }
 
-async function apiBoard(req, res, code, ip) {
+async function apiBoard(req, res, code, ip, user) {
   if (!rateOk(ip, 'board', 600, 60e3)) return fail(res, 429, 'খুব দ্রুত বোর্ড আপডেট হচ্ছে।');
-  const room = rooms.get(code);
+  const room = await loadRoomForUser(code, user.id);
   if (!room) return fail(res, 404, 'রুম নেই।');
   const b = await readJSON(req, MAX_BOARD);
-  const me = room.members.find(m => m.id === b.memberId);
+  const me = resolveRoomMember(room, user.id, b.memberId);
   if (!me || me.id !== room.ownerId) return fail(res, 403, 'শুধু শিক্ষক বোর্ড শেয়ার করতে পারবেন।');
   const p = b.page;
   if (!p || typeof p !== 'object' || !Array.isArray(p.items) || p.items.length > 5000) return fail(res, 400, 'ভুল বোর্ড ডেটা।');
@@ -269,16 +410,17 @@ async function apiBoard(req, res, code, ip) {
     }
   };
   touch(room);
+  await persistRoom(room, user.id);
   broadcastBoard(room);
   send(res, 200, { ok: true, seq });
 }
 
-async function apiAct(req, res, code, ip) {
+async function apiAct(req, res, code, ip, user) {
   if (!rateOk(ip, 'act', 240, 60e3)) return fail(res, 429, 'খুব দ্রুত অনুরোধ হচ্ছে।');
-  const room = rooms.get(code);
+  const room = await loadRoomForUser(code, user.id);
   if (!room) return fail(res, 404, 'রুম নেই।');
   const b = await readJSON(req);
-  const me = room.members.find(m => m.id === b.memberId);
+  const me = resolveRoomMember(room, user.id, b.memberId);
   if (!me) return fail(res, 403, 'সদস্য নন।');
   const isOwner = me.id === room.ownerId;
   const needOwner = () => isOwner || fail(res, 403, 'শুধু রুমের শিক্ষক এটি করতে পারবেন।');
@@ -387,7 +529,9 @@ async function apiAct(req, res, code, ip) {
     }
     default: return fail(res, 400, 'অজানা কাজ।');
   }
-  touch(room); broadcast(room);
+  touch(room);
+  await persistRoom(room, user.id);
+  broadcast(room);
   send(res, 200, { ok: true, room: viewFor(room, me.id) });
 }
 
@@ -425,23 +569,32 @@ function serveStatic(req, res, pathname) {
 
 /* ---------- রাউটার ---------- */
 const server = http.createServer(async (req, res) => {
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
   try {
     const url = new URL(req.url, 'http://x');
     const ip = clientIp(req);
     const p = url.pathname;
 
-    if (p === '/api/health') return send(res, 200, { ok: true, rooms: rooms.size });
+    if (p === '/api/health') return send(res, 200, { ok: true, storage: useDatabase ? 'neon' : 'file' });
 
     if (p.startsWith('/api/')) {
       if (!rateOk(ip, 'all', 300, 60e3)) return fail(res, 429, 'খুব বেশি অনুরোধ।');
-      if (req.method === 'POST' && p === '/api/rooms') return await apiCreate(req, res, ip);
-      if (req.method === 'POST' && p === '/api/rooms/join') return await apiJoin(req, res, ip);
+      if (req.method === 'GET' && p === '/api/config') {
+        return send(res, 200, { neonAuthUrl: process.env.NEON_AUTH_BASE_URL || '' });
+      }
       let m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/stream$/);
-      if (req.method === 'GET' && m) return apiStream(req, res, m[1], url.searchParams.get('m') || '');
+      if (req.method === 'GET' && m) return await apiStream(req, res, m[1], url.searchParams.get('t') || '');
+
+      const user = await authenticate(req);
+      if (!user) return fail(res, 401, 'ক্লাস ফিচার ব্যবহার করতে ইমেইল দিয়ে সাইন ইন করুন।');
+      if (req.method === 'POST' && p === '/api/rooms') return await apiCreate(req, res, ip, user);
+      if (req.method === 'POST' && p === '/api/rooms/join') return await apiJoin(req, res, ip, user);
+      m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/stream-ticket$/);
+      if (req.method === 'POST' && m) return await apiStreamTicket(req, res, m[1], user);
       m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/board$/);
-      if (req.method === 'POST' && m) return await apiBoard(req, res, m[1], ip);
+      if (req.method === 'POST' && m) return await apiBoard(req, res, m[1], ip, user);
       m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/act$/);
-      if (req.method === 'POST' && m) return await apiAct(req, res, m[1], ip);
+      if (req.method === 'POST' && m) return await apiAct(req, res, m[1], ip, user);
       return fail(res, 404, 'রুট নেই।');
     }
 
@@ -455,8 +608,16 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.keepAliveTimeout = 65000;
-loadData();
-server.listen(PORT, () => console.log(`স্মার্ট ব্ল্যাকবোর্ড চালু: http://localhost:${PORT}`));
+loadData().then(() => {
+  server.listen(PORT, () => console.log(`স্মার্ট ব্ল্যাকবোর্ড চালু: http://localhost:${PORT}`));
+}).catch(error => {
+  console.error('[startup] Room storage could not be initialized:', error.message);
+  process.exitCode = 1;
+});
 
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { persist(); process.exit(0); });
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => {
+  persist();
+  if (database) database.pool.end().finally(() => process.exit(0));
+  else process.exit(0);
+});
     

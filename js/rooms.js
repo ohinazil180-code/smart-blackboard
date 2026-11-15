@@ -17,6 +17,8 @@ const rm = {
   views: {},           // code -> সার্ভার থেকে পাওয়া রুম-দৃশ্য
   recent: [],          // জানা রুমের কোডের তালিকা
   es: null, esCode: null,
+  streamGeneration: 0, streamRetryTimer: null, streamAttempt: 0,
+  authUser: null, authUnavailable: false,
   online: true
 };
 let rmTimer = null;
@@ -47,11 +49,15 @@ const roleName = r => r === 'teacher' ? 'শিক্ষক' : r === 'student' ?
 
 /* ---------- API ---------- */
 async function api(path, body) {
+  const session = await ensureRoomAuth();
+  if (!session) throw new Error('ক্লাস ফিচার ব্যবহারের জন্য সাইন ইন করুন।');
+  const headers = { Authorization: `Bearer ${session.accessToken}` };
+  if (body) headers['Content-Type'] = 'application/json';
   let res;
   try {
     res = await fetch(path, {
       method: body ? 'POST' : 'GET',
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
       cache: 'no-store'
     });
@@ -75,28 +81,112 @@ function setView(v) {
   if (rmBC) rmBC.postMessage(v.code);
   rmRefresh();
 }
-function openStream(code) {
-  const memberId = rm.mem[code];
-  if (!memberId) return;
+async function openStream(code) {
+  if (!rm.mem[code]) return;
   if (rm.esCode === code && rm.es && rm.es.readyState !== EventSource.CLOSED) return;
   closeStream();
-  const es = new EventSource(`/api/rooms/${encodeURIComponent(code)}/stream?m=${encodeURIComponent(memberId)}`);
-  rm.es = es; rm.esCode = code;
-  es.addEventListener('state', e => {
-    try { rm.views[code] = JSON.parse(e.data); rmRefresh(); } catch (_) { }
-  });
-  es.addEventListener('board', e => {
-    try { rmOnBoard(code, JSON.parse(e.data)); } catch (_) { }
-  });
-  es.onerror = () => {
-    // সদস্যপদ বাতিল হলে (403/রুম মুছে গেলে) স্ট্রিম বন্ধ হয়ে যায়
-    if (es.readyState === EventSource.CLOSED) { closeStream(); }
-  };
+  const generation = rm.streamGeneration;
+  try {
+    const { ticket } = await api(`/api/rooms/${encodeURIComponent(code)}/stream-ticket`, { memberId: rm.mem[code] });
+    if (generation !== rm.streamGeneration || rm.cur !== code) return;
+    const es = new EventSource(`/api/rooms/${encodeURIComponent(code)}/stream?t=${encodeURIComponent(ticket)}`);
+    rm.es = es; rm.esCode = code;
+    es.onopen = () => { rm.streamAttempt = 0; };
+    es.addEventListener('state', e => {
+      try { rm.views[code] = JSON.parse(e.data); rmRefresh(); } catch (_) { }
+    });
+    es.addEventListener('board', e => {
+      try { rmOnBoard(code, JSON.parse(e.data)); } catch (_) { }
+    });
+    es.onerror = () => {
+      if (rm.es !== es) return;
+      es.close(); rm.es = null; rm.esCode = null;
+      scheduleStreamReconnect(code, generation);
+    };
+  } catch (error) {
+    if (generation === rm.streamGeneration && rm.cur === code) scheduleStreamReconnect(code, generation);
+    if (!rm.authUser) toast('সাইন ইন করে আবার ক্লাসে যুক্ত হন।', 3500);
+  }
+}
+function scheduleStreamReconnect(code, generation) {
+  if (generation !== rm.streamGeneration || rm.cur !== code || rm.streamRetryTimer) return;
+  rm.streamAttempt = Math.min(rm.streamAttempt + 1, 6);
+  const delay = Math.min(30_000, 1000 * 2 ** (rm.streamAttempt - 1));
+  rm.streamRetryTimer = setTimeout(() => {
+    rm.streamRetryTimer = null;
+    openStream(code);
+  }, delay);
 }
 function closeStream() {
+  rm.streamGeneration++;
+  clearTimeout(rm.streamRetryTimer);
+  rm.streamRetryTimer = null;
   if (rm.es) rm.es.close();
   rm.es = null; rm.esCode = null;
 }
+async function ensureRoomAuth() {
+  try {
+    const auth = await window.sbAuthReady;
+    const current = await auth.getSession();
+    if (current) { rm.authUser = current.user; return current; }
+    const name = h('input', { class: 'inp', type: 'text', maxlength: 60, autocomplete: 'name', placeholder: 'আপনার নাম' });
+    const email = h('input', { class: 'inp', type: 'email', required: true, autocomplete: 'email', placeholder: 'name@example.com' });
+    const password = h('input', { class: 'inp', type: 'password', required: true, autocomplete: 'current-password', placeholder: 'কমপক্ষে ৮ অক্ষর' });
+    const status = h('p', { class: 'hint', role: 'status', 'aria-live': 'polite' });
+    const field = (label, input) => h('label', { class: 'rm-auth-field' }, h('span', {}, label), input);
+    const body = h('div', { class: 'rm-auth-form' }, field('নাম (নতুন অ্যাকাউন্টে)', name), field('ইমেইল', email), field('পাসওয়ার্ড', password), status);
+    const result = await modal({
+      title: 'অনলাইন ক্লাসে সাইন ইন',
+      body,
+      buttons: [
+        { text: 'বাতিল', val: null },
+        { text: 'সাইন ইন', act: close => submit(false, close) },
+        { text: 'অ্যাকাউন্ট তৈরি', cls: 'pri', act: close => submit(true, close) }
+      ]
+    });
+    if (!result) return null;
+    rm.authUser = result.user;
+    if (result.user?.name && !rm.name) { rm.name = result.user.name; rmPersist(); }
+    renderRmStatus();
+    return result;
+
+    async function submit(createAccount, close) {
+      if (!email.reportValidity() || !password.reportValidity()) return;
+      if (createAccount && !name.value.trim()) { status.textContent = 'নতুন অ্যাকাউন্টে আপনার নাম লিখুন।'; name.focus(); return; }
+      status.textContent = 'যাচাই করা হচ্ছে…';
+      try {
+        const response = createAccount
+          ? await auth.signUp({ email: email.value.trim(), password: password.value, name: name.value.trim() })
+          : await auth.signIn({ email: email.value.trim(), password: password.value });
+        if (response.error) { status.textContent = 'সাইন ইন করা যায়নি। তথ্য যাচাই করে আবার চেষ্টা করুন।'; return; }
+        const session = await auth.getSession();
+        if (!session) { status.textContent = 'অ্যাকাউন্ট তৈরি হয়েছে, কিন্তু সেশন পাওয়া যায়নি। আবার সাইন ইন করুন।'; return; }
+        close(session);
+      } catch {
+        status.textContent = 'সাইন-ইন পরিষেবা এখন পাওয়া যাচ্ছে না। আবার চেষ্টা করুন।';
+      }
+    }
+  } catch {
+    rm.authUnavailable = true;
+    toast('সাইন-ইন পরিষেবা এখন পাওয়া যাচ্ছে না।', 3500);
+    return null;
+  }
+}
+async function roomSignOut() {
+  try {
+    const auth = await window.sbAuthReady;
+    await auth.signOut();
+    rm.authUser = null; rm.cur = null; rm.views = {};
+    closeStream(); rmPersist(); renderRmStatus();
+    toast('সাইন আউট হয়েছে');
+  } catch { toast('সাইন আউট করা যায়নি। আবার চেষ্টা করুন।'); }
+}
+window.addEventListener('sb-auth-state', event => {
+  rm.authUser = event.detail?.user || null;
+  rm.authUnavailable = !!event.detail?.unavailable;
+  if (rm.authUser?.name && !rm.name) { rm.name = rm.authUser.name; rmPersist(); }
+  renderRmStatus();
+});
 function rmRefresh() {
   if (rmLiveCode && (rm.cur !== rmLiveCode || rm.role !== 'student')) rmEndLive();
   renderRmStatus();
@@ -119,11 +209,13 @@ function renderRmStatus() {
   const box = $('#rmStatus'); if (!box) return;
   const v = curView();
   box.replaceChildren(
+    h('div', { class: 'rm-line' }, h('b', {}, 'অ্যাকাউন্ট: '), rm.authUser?.email || (rm.authUnavailable ? 'সাইন-ইন পরিষেবা অনুপলব্ধ' : 'সাইন ইন আবশ্যক')),
     h('div', { class: 'rm-line' }, h('b', {}, 'রোল: '), roleName(rm.role)),
     h('div', { class: 'rm-line' }, h('b', {}, 'রুম: '),
       v ? `${v.name} (${v.code})${v.status === 'ended' ? ' — শেষ' : ''}` : 'কোনো রুম নেই'),
     v && v.you && v.you.groupId ? h('div', { class: 'rm-line' }, h('b', {}, 'গ্রুপ: '), (v.groups.find(g => g.id === v.you.groupId) || {}).name || '—') : null,
     h('div', { class: 'rm-line' }, h('small', {}, rm.online ? '● সার্ভার সংযুক্ত' : '○ সার্ভারে সংযোগ নেই')),
+    h('button', { class: 'chip', onclick: () => rm.authUser ? roomSignOut() : ensureRoomAuth() }, rm.authUser ? 'সাইন আউট' : 'সাইন ইন / অ্যাকাউন্ট তৈরি'),
     h('button', { class: 'chip', onclick: () => { closeUI(); roleDialog(); } }, 'রোল বদলান')
   );
 }

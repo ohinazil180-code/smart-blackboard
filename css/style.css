@@ -113,6 +113,8 @@ select.inp{appearance:auto}
 .addbtn .ic{color:#a78bfa}
 .addbtn.black{background:#0b0c0f}.addbtn.white{background:#e9ebf0;color:#111}.addbtn.white .ic{color:#5b21b6}
 .plist{display:flex;flex-direction:column;gap:8px}
+.rm-auth-form{display:flex;flex-direction:column;gap:10px}
+.rm-auth-field{display:flex;flex-direction:column;gap:5px;color:var(--mut);font-size:13px}
 .prow{display:flex;align-items:center;gap:4px;background:#1d2028;border:1px solid #2f3440;border-radius:14px;padding:4px}
 .prow.cur{border-color:var(--neon)}
 .pmain{flex:1;min-width:0;text-align:left;border:0;background:none;padding:8px 10px;display:flex;flex-direction:column;gap:2px}
