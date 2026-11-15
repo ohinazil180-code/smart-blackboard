@@ -101,6 +101,7 @@ function rmRefresh() {
   if (rmLiveCode && (rm.cur !== rmLiveCode || rm.role !== 'student')) rmEndLive();
   renderRmStatus();
   if (rmRefresh.groupsDraw) rmRefresh.groupsDraw();
+  if (rmRefresh.micDraw) rmRefresh.micDraw();
 }
 
 async function rmAct(body) {
@@ -271,6 +272,53 @@ async function roomGroups() {
   finally { rmRefresh.groupsDraw = null; }
 }
 
+/* ---------- শিক্ষক-নিয়ন্ত্রিত কথা বলার অনুরোধ ---------- */
+async function roomMic() {
+  const initial = curView();
+  if (!initial) return toast('আগে একটি রুম বেছে নিন');
+  const body = h('div', { class: 'plist' });
+  const owner = isOwner(initial);
+  const draw = () => {
+    const v = curView() || initial;
+    const mic = v.mic || { queue: [], grant: null, mediaAvailable: false };
+    body.replaceChildren();
+    if (owner) {
+      body.append(h('p', { class: 'hint' }, 'এক সময়ে একজন শিক্ষার্থীকে অনুমতি দেওয়া হয়। শিক্ষক চাইলে যেকোনো সময় অনুমতি বাতিল করতে পারবেন।'));
+      if (mic.grant) {
+        body.append(h('div', { class: 'prow' },
+          h('div', { class: 'pmain' }, h('b', {}, `${mic.grant.name} — অনুমতি অপেক্ষমাণ`), h('span', {}, 'লাইভ অডিও/ভিডিও সংযুক্ত নেই; কোনো অডিও প্রকাশিত হচ্ছে না।')),
+          h('button', { class: 'chip danger', onclick: async () => { await rmAct({ type: 'mic.revoke', target: mic.grant.memberId }); draw(); } }, 'অনুমতি বাতিল')));
+      }
+      if (!mic.queue.length) body.append(h('p', { class: 'hint' }, 'কেউ হাত তোলেনি।'));
+      for (const member of mic.queue) {
+        body.append(h('div', { class: 'prow' },
+          h('div', { class: 'pmain' }, h('b', {}, member.name), h('span', {}, 'কথা বলার অনুরোধ')),
+          h('button', { class: 'chip pri', disabled: !!mic.grant, onclick: async () => { await rmAct({ type: 'hand.approve', target: member.id }); draw(); } }, 'অনুমতি দিন'),
+          h('button', { class: 'chip', onclick: async () => { await rmAct({ type: 'hand.dismiss', target: member.id }); draw(); } }, 'বাদ দিন')));
+      }
+      if (!mic.mediaAvailable) body.append(h('p', { class: 'hint' }, 'লাইভ অডিও/ভিডিও প্রকাশনা নিষ্ক্রিয়: LiveKit server credentials যোগ না হওয়া পর্যন্ত অনুমোদন শুধু queue-তে থাকবে।'));
+    } else {
+      const status = v.you?.micStatus || 'idle';
+      const statusText = {
+        idle: 'আপনি এখনো কথা বলার অনুরোধ করেননি।',
+        hand_raised: 'আপনার অনুরোধ শিক্ষকের queue-তে আছে।',
+        approved_waiting: 'শিক্ষক অনুমতি দিয়েছেন। লাইভ অডিও সংযুক্ত না থাকায় এখনো কোনো অডিও পাঠানো হচ্ছে না।',
+        permission_ready: 'মাইক্রোফোন অনুমতি প্রস্তুত, কিন্তু live audio connection নেই।',
+        revoked: 'শিক্ষক অনুমতি বাতিল করেছেন। চাইলে আবার হাত তুলুন।'
+      }[status] || 'কথা বলার অনুরোধের অবস্থা পাওয়া যায়নি।';
+      body.append(h('p', { class: 'hint' }, statusText));
+      if (status !== 'approved_waiting' && status !== 'permission_ready') {
+        body.append(h('button', { class: 'chip pri', onclick: async () => { await rmAct({ type: status === 'hand_raised' ? 'hand.lower' : 'hand.raise' }); draw(); } }, status === 'hand_raised' ? 'হাত নামান' : status === 'revoked' ? 'আবার হাত তুলুন' : 'হাত তুলুন'));
+      }
+      body.append(h('p', { class: 'hint' }, 'অনুমতি ছাড়া মাইক্রোফোন প্রকাশ হয় না। LiveKit credentials যোগ না হওয়া পর্যন্ত এই রুমে audio/video broadcasting বন্ধ আছে।'));
+    }
+  };
+  rmRefresh.micDraw = draw;
+  draw();
+  try { await modal({ title: owner ? 'হাত তোলা ও মাইক নিয়ন্ত্রণ' : 'কথা বলার অনুরোধ', body, buttons: [{ text: 'বন্ধ', val: null }] }); }
+  finally { rmRefresh.micDraw = null; }
+}
+
 /* ---------- ক্লাস টাইমার ---------- */
 function timerStart(mins) {
   timerStop(true);
@@ -424,6 +472,7 @@ const RM_MENU_BLOCK = [
   { id: 'roomJoin', icon: 'share', text: 'রুমে যোগ দিন (কোড দিয়ে)' },
   { id: 'roomMine', icon: 'folder', text: 'আমার রুমসমূহ' },
   { id: 'roomGroups', icon: 'grid', text: 'গ্রুপ ও সদস্য ব্যবস্থাপনা' },
+  { id: 'roomMic', icon: 'share', text: 'হাত তোলা ও মাইক অনুমতি' },
   { sec: 'ক্লাসের সরঞ্জাম' },
   { id: 'timer', icon: 'play', text: 'ক্লাস টাইমার' }
 ];
@@ -436,7 +485,7 @@ function rmInjectMenu() {
   MENU.splice(MENU.findIndex(m => m.id === 'about'), 0, { id: 'help', icon: 'info', text: 'সাহায্য: কিভাবে ব্যবহার করবেন' });
 }
 const RM_ACTS = {
-  roleSwitch: roleDialog, roomCreate, roomJoin, roomMine, roomGroups,
+  roleSwitch: roleDialog, roomCreate, roomJoin, roomMine, roomGroups, roomMic,
   timer: timerDialog, install: installApp,
   help: () => modal({ title: 'সাহায্য', body: [
     h('p', {}, '১. রোল: শিক্ষক হলে রুম ও গ্রুপ বানাবেন। শিক্ষার্থী হলে রুম কোড দিয়ে যোগ দেবেন।'),

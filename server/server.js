@@ -28,10 +28,24 @@ const rateBuckets = new Map(); // ip:bucket -> {n, reset}
 const joinFails = new Map();   // ip -> {n, reset}
 
 /* ---------- ডেটা ---------- */
+function ensureMicState(room) {
+  if (!room.mic) room.mic = { queue: [], grant: null };
+  if (!Array.isArray(room.mic.queue)) room.mic.queue = [];
+  if (!room.mic.grant || typeof room.mic.grant !== 'object') room.mic.grant = null;
+  for (const member of room.members || []) member.micStatus ||= 'idle';
+  return room.mic;
+}
+function revokeMic(room, memberId, status = 'revoked') {
+  const mic = ensureMicState(room);
+  mic.queue = mic.queue.filter(id => id !== memberId);
+  if (mic.grant?.memberId === memberId) mic.grant = null;
+  const member = room.members.find(item => item.id === memberId);
+  if (member) member.micStatus = status;
+}
 function loadData() {
   try {
     const j = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    for (const r of j.rooms || []) if (r && r.code) rooms.set(r.code, r);
+    for (const r of j.rooms || []) if (r && r.code) { ensureMicState(r); rooms.set(r.code, r); }
     console.log(`[data] ${rooms.size} টি রুম লোড হয়েছে`);
   } catch (_) { /* প্রথমবার চালু — ফাইল নেই */ }
 }
@@ -101,17 +115,26 @@ setInterval(() => {
 function viewFor(room, memberId) {
   const me = room.members.find(m => m.id === memberId);
   const isOwner = !!me && me.id === room.ownerId;
+  const mic = ensureMicState(room);
+  const publicMember = m => ({
+    name: m.name, role: m.role, groupId: m.groupId, joinedAt: m.joinedAt,
+    micStatus: m.micStatus || 'idle',
+    ...(isOwner ? { id: m.id } : {}),
+    ...(m.id === memberId ? { me: true } : {})
+  });
+  const grantMember = mic.grant && room.members.find(m => m.id === mic.grant.memberId);
   return {
     code: room.code,
     name: room.name,
     status: room.status,
     groups: room.groups.map(g => ({ id: g.id, name: g.name })),
-    members: room.members.map(m => ({
-      name: m.name, role: m.role, groupId: m.groupId, joinedAt: m.joinedAt,
-      ...(isOwner ? { id: m.id } : {}),           // শুধু মালিক সদস্য-আইডি দেখে
-      ...(m.id === memberId ? { me: true } : {})
-    })),
-    you: me ? { id: me.id, role: me.role, groupId: me.groupId, isOwner } : null
+    members: room.members.map(publicMember),
+    mic: {
+      queue: mic.queue.map(id => room.members.find(m => m.id === id)).filter(Boolean).map(publicMember),
+      grant: grantMember ? { name: grantMember.name, state: mic.grant.state, ...(isOwner || grantMember.id === memberId ? { memberId: grantMember.id } : {}) } : null,
+      mediaAvailable: false
+    },
+    you: me ? { id: me.id, role: me.role, groupId: me.groupId, isOwner, micStatus: me.micStatus || 'idle' } : null
   };
 }
 function broadcast(room) {
@@ -163,7 +186,8 @@ async function apiCreate(req, res, ip) {
   const room = {
     code: newCode(), name, status: 'live', ownerId, createdAt: now(), updatedAt: now(),
     groups: [{ id: rid(), name: 'গ্রুপ ১' }, { id: rid(), name: 'গ্রুপ ২' }],
-    members: [{ id: ownerId, name: memberName, role: 'teacher', groupId: null, joinedAt: now() }]
+    members: [{ id: ownerId, name: memberName, role: 'teacher', groupId: null, joinedAt: now(), micStatus: 'idle' }],
+    mic: { queue: [], grant: null }
   };
   rooms.set(room.code, room); touch(room);
   send(res, 201, { memberId: ownerId, room: viewFor(room, ownerId) });
@@ -210,7 +234,15 @@ function apiStream(req, res, code, memberId) {
   res.write(`event: state\ndata: ${JSON.stringify(viewFor(room, memberId))}\n\n`);
   if (room.board) res.write(`event: board\ndata: ${JSON.stringify(room.board)}\n\n`);
   const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) { } }, 25000);
-  req.on('close', () => { clearInterval(hb); streams.get(code)?.delete(entry); });
+  req.on('close', () => {
+    clearInterval(hb);
+    streams.get(code)?.delete(entry);
+    if (room.mic?.grant?.memberId === memberId) {
+      revokeMic(room, memberId);
+      touch(room);
+      broadcast(room);
+    }
+  });
 }
 
 async function apiBoard(req, res, code, ip) {
@@ -267,7 +299,57 @@ async function apiAct(req, res, code, ip) {
     case 'room.status': {
       if (!isOwner) return needOwner();
       if (!['live', 'ended'].includes(b.status)) return fail(res, 400, 'ভুল অবস্থা।');
-      room.status = b.status; break;
+      room.status = b.status;
+      if (b.status === 'ended') {
+        const mic = ensureMicState(room);
+        mic.queue = [];
+        if (mic.grant) revokeMic(room, mic.grant.memberId);
+      }
+      break;
+    }
+    case 'hand.raise': {
+      if (isOwner || me.role !== 'student') return fail(res, 403, 'শুধু শিক্ষার্থীরা হাত তুলতে পারবেন।');
+      if (room.status !== 'live') return fail(res, 409, 'ক্লাসটি এখন চালু নেই।');
+      const mic = ensureMicState(room);
+      if (mic.grant?.memberId === me.id) return fail(res, 409, 'আপনার মাইক অনুরোধ ইতিমধ্যে অনুমোদিত।');
+      if (!mic.queue.includes(me.id)) mic.queue.push(me.id);
+      me.micStatus = 'hand_raised';
+      break;
+    }
+    case 'hand.lower': {
+      if (isOwner || me.role !== 'student') return fail(res, 403, 'শুধু শিক্ষার্থীরা নিজের হাত নামাতে পারবেন।');
+      const mic = ensureMicState(room);
+      if (mic.grant?.memberId === me.id) return fail(res, 409, 'অনুমোদিত মাইক বন্ধ করতে শিক্ষককে বলুন।');
+      mic.queue = mic.queue.filter(id => id !== me.id);
+      me.micStatus = 'idle';
+      break;
+    }
+    case 'hand.approve': {
+      if (!isOwner) return needOwner();
+      const mic = ensureMicState(room);
+      const target = room.members.find(m => m.id === b.target);
+      if (!target || target.id === room.ownerId || !mic.queue.includes(target.id)) return fail(res, 404, 'অপেক্ষমাণ অনুরোধ পাওয়া যায়নি।');
+      if (mic.grant && mic.grant.memberId !== target.id) return fail(res, 409, 'এক সময়ে একজন শিক্ষার্থীর মাইক অনুমোদন করা যায়।');
+      mic.queue = mic.queue.filter(id => id !== target.id);
+      mic.grant = { memberId: target.id, state: 'approved_waiting', grantedAt: now() };
+      target.micStatus = 'approved_waiting';
+      break;
+    }
+    case 'hand.dismiss': {
+      if (!isOwner) return needOwner();
+      const mic = ensureMicState(room);
+      const target = room.members.find(m => m.id === b.target);
+      if (!target || !mic.queue.includes(target.id)) return fail(res, 404, 'অপেক্ষমাণ অনুরোধ পাওয়া যায়নি।');
+      mic.queue = mic.queue.filter(id => id !== target.id);
+      target.micStatus = 'idle';
+      break;
+    }
+    case 'mic.revoke': {
+      if (!isOwner) return needOwner();
+      const mic = ensureMicState(room);
+      if (!mic.grant || (b.target && mic.grant.memberId !== b.target)) return fail(res, 404, 'কোনো সক্রিয় মাইক অনুমতি নেই।');
+      revokeMic(room, mic.grant.memberId);
+      break;
     }
     case 'room.rename': {
       if (!isOwner) return needOwner();
@@ -300,6 +382,7 @@ async function apiAct(req, res, code, ip) {
     case 'member.remove': {
       if (!isOwner) return needOwner();
       if (b.target === room.ownerId) return fail(res, 400, 'মালিককে সরানো যায় না।');
+      revokeMic(room, b.target);
       room.members = room.members.filter(m => m.id !== b.target); break;
     }
     default: return fail(res, 400, 'অজানা কাজ।');
