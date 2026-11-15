@@ -108,7 +108,7 @@ test('authenticated classroom roles, board writes, mic grants, and stream ticket
   assert.equal(health.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
   assert.equal(health.headers.get('x-frame-options'), 'DENY');
   assert.equal(health.headers.get('strict-transport-security'), 'max-age=63072000');
-  assert.equal(health.headers.get('permissions-policy'), 'camera=(self), microphone=(self), geolocation=()');
+  assert.equal(health.headers.get('permissions-policy'), 'camera=(), microphone=(), geolocation=()');
 
   assert.equal((await request(baseUrl, '/api/rooms', { name: 'Unauthenticated class' })).status, 401);
   const created = await request(baseUrl, '/api/rooms', { name: 'Test class', memberName: 'Teacher' }, teacherToken);

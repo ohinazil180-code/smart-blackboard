@@ -37,7 +37,7 @@ const SECURITY_HEADERS = Object.freeze({
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'X-Frame-Options': 'DENY',
   'Strict-Transport-Security': 'max-age=63072000',
-  'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=()'
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
 });
 
 /* ---------- ডেটা ---------- */
