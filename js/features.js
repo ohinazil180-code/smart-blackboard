@@ -311,6 +311,7 @@ function buildExtraColors() {
 function fxMutate(fn) {
   const p = S.page;
   if (S.sel < 0 || !p.items[S.sel]) return toast('আগে একটি লেখা, ছবি বা আকৃতি নির্বাচন করুন');
+  if (p.items[S.sel].locked) return toast('অবজেক্টটি সুরক্ষিত — আগে আনলক করুন');
   const n = { ...p.items[S.sel] };
   fn(n);
   p.items[S.sel] = n;
@@ -335,7 +336,7 @@ const _updateOpts = updateOpts;
 updateOpts = function () {
   _updateOpts();
   const sel = S.sel >= 0 ? S.page && S.page.items[S.sel] : null;
-  const r = $('#rowEdit'); if (r) r.hidden = !(sel && (sel.t === 'text' || sel.t === 'pic'));
+  const r = $('#rowEdit'); if (r) r.hidden = !(sel && !sel.locked && (sel.t === 'text' || sel.t === 'pic'));
   const pk = $('#rowPenKind'); if (pk) pk.hidden = S.tool !== 'pen';
 };
 

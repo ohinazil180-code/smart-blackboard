@@ -386,6 +386,7 @@ function showOcrResult(text, rect) {
 /* ---------- টেক্সট বক্স ---------- */
 async function editText(idx, x, y) {
   const p = S.page, ex = idx >= 0 ? p.items[idx] : null;
+  if (ex?.locked) return toast('লেখাটি সুরক্ষিত — আগে আনলক করুন');
   const st = { size: ex ? ex.size : S.sizes.text, color: ex ? ex.color : S.color, bold: !!(ex && ex.bold), glow: !!(ex && ex.glow), align: (ex && ex.align) || 'left' };
   const ta = h('textarea', { class: 'inp ta', rows: 4, placeholder: 'এখানে লিখুন… (বাংলা / English)' });
   ta.value = ex ? ex.text : '';
@@ -563,6 +564,7 @@ function bindUI() {
   $('#customColor').oninput = e => setColor(e.target.value);
   els.size.oninput = () => onSizeInput(false); els.size.onchange = () => onSizeInput(true);
   $('#selEdit').onclick = () => editText(S.sel, 0, 0);
+  $('#selLock').onclick = toggleSelLock;
   $('#selDup').onclick = dupSel; $('#selDel').onclick = deleteSel;
   $('#selDone').onclick = () => { S.sel = -1; updateSelBar(); drawOv(); };
   $('#busyCancel').onclick = () => busyCancel && busyCancel();
