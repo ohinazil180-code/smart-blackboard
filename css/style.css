@@ -49,6 +49,8 @@ button{font-family:inherit;cursor:pointer;color:inherit}
 .sw.on{border-color:#fff;box-shadow:0 0 0 2.5px rgba(255,255,255,.55),0 0 10px rgba(255,255,255,.4)}
 .sw.custom{background:conic-gradient(#f87171,#facc15,#4ade80,#22d3ee,#60a5fa,#c084fc,#f87171);overflow:hidden;display:block}
 .sw.custom input{position:absolute;inset:-6px;width:44px;height:44px;opacity:0;cursor:pointer}
+#rowEdit{overflow-x:auto;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.45) transparent}
+#rowEdit .chip{flex:none}
 #rowSize span{font-size:12px;white-space:nowrap;min-width:84px;color:#ede9fe}
 #rowSize b{min-width:28px;text-align:right;font-size:13px;font-variant-numeric:tabular-nums}
 input[type=range]{flex:1;min-width:0;height:28px;accent-color:#fff;background:transparent}

@@ -7,6 +7,7 @@
 - Neon Postgres-এ room, group ও participant state; SSE দিয়ে live roster, hand-raise queue এবং teacher board sync
 - Teacher-only board publishing এবং student read-only classroom view; reconnect হলে সর্বশেষ board snapshot পুনরায় পাঠানো হয়
 - কালো/সাদা বোর্ড: কলম, হাইলাইটার, ইরেজার, আকৃতি, লেখা, আনডু/রিডু, জুম, প্যান
+- অবজেক্ট এডিটিং: শেপ/লেখা ১৫° করে ঘোরানো, ভরাট চালু/বন্ধ, লেয়ার সামনে/পেছনে সাজানো; লক করা অবজেক্ট সরানো, ঘোরানো, এডিট ও মুছে ফেলা যায় না
 - নোটবুক ও পাতা ব্যবস্থাপনা: টেমপ্লেট, পাতা কপি/মোছা/সরানো
 - PDF ইমপোর্ট ও মার্কআপ, ছবি ইমপোর্ট, PDF ও PNG এক্সপোর্ট
 - OCR (বাংলা + ইংরেজি) — স্ক্যান করা পাতা থেকে লেখা শনাক্ত
