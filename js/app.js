@@ -215,7 +215,7 @@ const goPage = d => { const n = S.P.cur + d; if (n >= 0 && n < S.P.pages.length)
 /* ---------- রঙ/সাইজ/টুল সেটিংস ---------- */
 function sizeKey() {
   const t = S.tool;
-  if (t === 'select') { const it = S.page.items[S.sel]; return it ? (it.t === 'text' ? 'text' : it.t === 'hl' ? 'hl' : it.t === 'pen' ? 'pen' : 'shape') : null; }
+  if (t === 'select') { const it = S.page.items[S.sel]; return it && !it.locked ? (it.t === 'text' ? 'text' : it.t === 'hl' ? 'hl' : it.t === 'pen' ? 'pen' : 'shape') : null; }
   return { pen: 'pen', hl: 'hl', er: 'er', shape: 'shape', text: 'text' }[t] || null;
 }
 function replaceSel(patch, doCommit) {
@@ -229,7 +229,7 @@ function setColor(c, silent) {
   S.color = c;
   $$('#swatches .sw').forEach(b => b.classList.toggle('on', b.dataset.c === c));
   $('#customColor').value = /^#[0-9a-f]{6}$/i.test(c) ? c : '#ffffff';
-  if (!silent && S.tool === 'select' && S.sel >= 0) { const it = S.page.items[S.sel]; if (it && it.t !== 'er') replaceSel({ color: c, ...(typeof it.fill === 'string' ? { fill: c } : {}) }, true); }
+  if (!silent && S.tool === 'select' && S.sel >= 0) { const it = S.page.items[S.sel]; if (it && !it.locked && it.t !== 'er') replaceSel({ color: c, ...(typeof it.fill === 'string' ? { fill: c } : {}) }, true); }
 }
 function updateSizeUI() {
   const k = sizeKey();
@@ -247,7 +247,7 @@ function onSizeInput(final) {
   els.sizeVal.textContent = v;
   if (S.tool === 'select' && S.sel >= 0) {
     const it = S.page.items[S.sel];
-    if (it.t !== 'er' && (it.t !== 'rect' || it.size > 0 || v > 0)) replaceSel({ size: v }, final);
+    if (!it.locked && it.t !== 'er' && (it.t !== 'rect' || it.size > 0 || v > 0)) replaceSel({ size: v }, final);
   } else S.sizes[k] = v;
   if (S.tool === 'er') { /* ইরেজার আকার */ }
 }
@@ -263,7 +263,8 @@ function setTool(t) {
 function updateOpts() {
   const t = S.tool, o = els.opts;
   const showShape = t === 'shape', showEr = t === 'er';
-  const showColor = ['pen', 'hl', 'shape', 'text'].includes(t) || (t === 'select' && S.sel >= 0);
+  const selectedItem = t === 'select' && S.sel >= 0 ? S.page.items[S.sel] : null;
+  const showColor = ['pen', 'hl', 'shape', 'text'].includes(t) || (selectedItem && !selectedItem.locked);
   const showSize = showColor || showEr;
   const hint = t === 'select' ? (S.sel >= 0 ? '' : 'আঁকা বা লেখায় ট্যাপ করে বেছে নিন, তারপর টেনে সরান। ফাঁকা জায়গায় টেনে পাতা সরান।')
     : t === 'text' ? 'পাতায় যেখানে লিখতে চান সেখানে ট্যাপ করুন। আগের লেখায় ট্যাপ করলে সম্পাদনা হবে।'
@@ -290,16 +291,33 @@ function resizeStage(refit) {
 function updateSelBar() {
   const show = S.tool === 'select' && S.sel >= 0 && !S.present && S.page.items[S.sel];
   els.selBar.hidden = !show;
-  if (show) $('#selEdit').hidden = S.page.items[S.sel].t !== 'text';
+  if (show) {
+    const it = S.page.items[S.sel], locked = !!it.locked;
+    $('#selEdit').hidden = locked || it.t !== 'text';
+    $('#selLock').classList.toggle('locked', locked);
+    $('#selLock').setAttribute('aria-label', locked ? 'আনলক করুন' : 'লক করুন');
+    $('#selLock').title = locked ? 'আনলক করুন' : 'লক করুন';
+    $('#selLock use').setAttribute('href', locked ? '#i-unlock' : '#i-lock');
+    $('#selDup').disabled = locked; $('#selDel').disabled = locked;
+  }
   if (S.tool === 'select') updateOpts();
+}
+function toggleSelLock() {
+  const p = S.page, it = p && p.items[S.sel];
+  if (!it) return;
+  p.items = p.items.slice(); p.items[S.sel] = { ...it, locked: !it.locked };
+  commit(); redrawInk(); drawOv(); updateSelBar();
+  toast(p.items[S.sel].locked ? 'অবজেক্ট সুরক্ষিত করা হয়েছে' : 'অবজেক্ট আনলক করা হয়েছে');
 }
 function deleteSel() {
   const p = S.page; if (S.sel < 0) return;
+  if (p.items[S.sel]?.locked) return toast('অবজেক্টটি সুরক্ষিত — আগে আনলক করুন');
   p.items = p.items.filter((_, i) => i !== S.sel);
   S.sel = -1; S.hidden = -1; commit(); redrawInk(); drawOv(); updateSelBar();
 }
 function dupSel() {
   const p = S.page, it = p.items[S.sel]; if (!it) return;
+  if (it.locked) return toast('অবজেক্টটি সুরক্ষিত — আগে আনলক করুন');
   p.items = [...p.items, moveItem(it, 32, 32)];
   S.sel = p.items.length - 1; commit(); redrawInk(); drawOv(); updateSelBar();
 }
@@ -327,7 +345,7 @@ function eraseSegPixel(a, b) {
 }
 function eraseObjectsAt(x, y) {
   const p = S.page, r = S.sizes.er / 2 * 0.8;
-  const keep = p.items.filter(it => !itemHit(it, x, y, r));
+  const keep = p.items.filter(it => it.locked || !itemHit(it, x, y, r));
   if (keep.length !== p.items.length) { p.items = keep; return true; }
   return false;
 }
@@ -361,10 +379,16 @@ function toolDown(e) {
     let hit = -1;
     for (let i = pg.items.length - 1; i >= 0; i--) if (itemHit(pg.items[i], p.x, p.y, r)) { hit = i; break; }
     if (hit >= 0) {
-      const wasSel = S.sel === hit;
-      S.sel = hit; S.hidden = hit;
-      drag = { kind: 'move', orig: pg.items[hit], sx: p.x, sy: p.y, moved: false, wasSel };
-      S.live = drag.orig; redrawInk(); drawOv(); updateSelBar();
+      const item = pg.items[hit], wasSel = S.sel === hit;
+      S.sel = hit;
+      if (item.locked) {
+        S.hidden = -1; S.live = null; drag = null;
+        redrawInk(); drawOv(); updateSelBar();
+      } else {
+        S.hidden = hit;
+        drag = { kind: 'move', orig: item, sx: p.x, sy: p.y, moved: false, wasSel };
+        S.live = drag.orig; redrawInk(); drawOv(); updateSelBar();
+      }
     } else {
       const had = S.sel >= 0; S.sel = -1; S.hidden = -1;
       drag = { kind: 'pan', cx: e.clientX, cy: e.clientY, tx: S.view.tx, ty: S.view.ty, moved: false, had };

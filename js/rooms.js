@@ -2,12 +2,12 @@
 /* =====================================================================
    রোল, রুম ও গ্রুপ (সার্ভার-সংযুক্ত), ক্লাস টাইমার, অ্যাপ ইনস্টল
    — কোনো লগইন নেই। রোল ব্যবহারকারী নিজে যেকোনো সময় বদলায়।
-   — রুম/গ্রুপ/সদস্য সার্ভারে থাকে, সব ডিভাইসে রিয়েল-টাইমে আপডেট হয়।
-   — বোর্ড (লেখা) এই ধাপে এখনো লোকাল; বোর্ড সিঙ্ক পরের ধাপ।
+   — রুম/গ্রুপ/সদস্য ও শিক্ষকের বোর্ড সার্ভারে থাকে, SSE-তে তাৎক্ষণিকভাবে সিঙ্ক হয়।
+   — ব্যক্তিগত নোট IndexedDB-তে থাকে; শিক্ষার্থীরা লাইভ ক্লাস বোর্ড শুধু পড়তে পারে।
    ===================================================================== */
 
 const LS = {
-  role: 'sb.role', name: 'sb.name', mem: 'sb.mem.v2', cur: 'sb.cur.v2', recent: 'sb.recent.v2'
+  role: 'sb.role', name: 'sb.name', mem: 'sb.mem.v2', cur: 'sb.cur.v2', recent: 'sb.recent.v2', sessions: 'sb.roomSessions.v1'
 };
 const rm = {
   role: null,          // 'teacher' | 'student' | null
@@ -16,8 +16,10 @@ const rm = {
   mem: {},             // code -> memberId (এই ডিভাইসের পরিচয়)
   views: {},           // code -> সার্ভার থেকে পাওয়া রুম-দৃশ্য
   recent: [],          // জানা রুমের কোডের তালিকা
+  sessions: {},        // রুম-সীমাবদ্ধ guest session, email account ছাড়া
   es: null, esCode: null,
-  online: true
+  streamGeneration: 0, streamRetryTimer: null, streamAttempt: 0,
+  online: navigator.onLine
 };
 let rmTimer = null;
 const rmBC = ('BroadcastChannel' in window) ? new BroadcastChannel('sb-rooms') : null;
@@ -30,6 +32,7 @@ function rmLoad() {
     rm.mem = JSON.parse(localStorage.getItem(LS.mem) || '{}') || {};
     rm.cur = localStorage.getItem(LS.cur);
     rm.recent = JSON.parse(localStorage.getItem(LS.recent) || '[]') || [];
+    rm.sessions = JSON.parse(localStorage.getItem(LS.sessions) || '{}') || {};
   } catch (_) { }
 }
 function rmPersist() {
@@ -39,6 +42,7 @@ function rmPersist() {
     localStorage.setItem(LS.mem, JSON.stringify(rm.mem));
     if (rm.cur) localStorage.setItem(LS.cur, rm.cur); else localStorage.removeItem(LS.cur);
     localStorage.setItem(LS.recent, JSON.stringify(rm.recent));
+    localStorage.setItem(LS.sessions, JSON.stringify(rm.sessions));
   } catch (_) { toast('স্টোরেজ পূর্ণ — ব্যাকআপ নিন'); }
 }
 const curView = () => (rm.cur && rm.views[rm.cur]) || null;
@@ -47,21 +51,32 @@ const roleName = r => r === 'teacher' ? 'শিক্ষক' : r === 'student' ?
 
 /* ---------- API ---------- */
 async function api(path, body) {
+  const routeCode = path.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\//)?.[1];
+  const code = (body?.code || routeCode || '').toUpperCase();
+  const token = rm.sessions[code];
+  const headers = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (body) headers['Content-Type'] = 'application/json';
   let res;
   try {
     res = await fetch(path, {
       method: body ? 'POST' : 'GET',
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
       cache: 'no-store'
     });
   } catch (_) {
-    rm.online = false; throw new Error('সার্ভারে সংযোগ নেই। ইন্টারনেট দেখুন।');
+    rm.online = false; rmRefresh();
+    throw new Error('সার্ভারে সংযোগ নেই। ইন্টারনেট দেখুন।');
   }
   rm.online = true;
   let data = {};
   try { data = await res.json(); } catch (_) { }
-  if (!res.ok) throw new Error(data.error || `ত্রুটি (${res.status})`);
+  if (!res.ok) {
+    const error = new Error(data.error || `ত্রুটি (${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 
@@ -75,25 +90,53 @@ function setView(v) {
   if (rmBC) rmBC.postMessage(v.code);
   rmRefresh();
 }
-function openStream(code) {
-  const memberId = rm.mem[code];
-  if (!memberId) return;
+async function openStream(code) {
+  if (!rm.mem[code]) return;
   if (rm.esCode === code && rm.es && rm.es.readyState !== EventSource.CLOSED) return;
   closeStream();
-  const es = new EventSource(`/api/rooms/${encodeURIComponent(code)}/stream?m=${encodeURIComponent(memberId)}`);
-  rm.es = es; rm.esCode = code;
-  es.addEventListener('state', e => {
-    try { rm.views[code] = JSON.parse(e.data); rmRefresh(); } catch (_) { }
-  });
-  es.addEventListener('board', e => {
-    try { rmOnBoard(code, JSON.parse(e.data)); } catch (_) { }
-  });
-  es.onerror = () => {
-    // সদস্যপদ বাতিল হলে (403/রুম মুছে গেলে) স্ট্রিম বন্ধ হয়ে যায়
-    if (es.readyState === EventSource.CLOSED) { closeStream(); }
-  };
+  const generation = rm.streamGeneration;
+  try {
+    const { ticket } = await api(`/api/rooms/${encodeURIComponent(code)}/stream-ticket`, { memberId: rm.mem[code] });
+    if (generation !== rm.streamGeneration || rm.cur !== code) return;
+    const es = new EventSource(`/api/rooms/${encodeURIComponent(code)}/stream?t=${encodeURIComponent(ticket)}`);
+    rm.es = es; rm.esCode = code;
+    es.onopen = () => { rm.streamAttempt = 0; rm.online = true; rmRefresh(); };
+    es.addEventListener('state', e => {
+      try { rm.views[code] = JSON.parse(e.data); rmRefresh(); } catch (_) { }
+    });
+    es.addEventListener('board', e => {
+      try { rmOnBoard(code, JSON.parse(e.data)); } catch (_) { }
+    });
+    es.onerror = () => {
+      if (rm.es !== es) return;
+      es.close(); rm.es = null; rm.esCode = null;
+      rm.online = false; rmRefresh();
+      scheduleStreamReconnect(code, generation);
+    };
+  } catch (error) {
+    if (generation !== rm.streamGeneration || rm.cur !== code) return;
+    if (error.status >= 400 && error.status < 500) {
+      rm.online = true;
+      toast(error.message, 3500);
+      rmRefresh();
+      return;
+    }
+    scheduleStreamReconnect(code, generation);
+  }
+}
+function scheduleStreamReconnect(code, generation) {
+  if (generation !== rm.streamGeneration || rm.cur !== code || rm.streamRetryTimer) return;
+  rm.streamAttempt = Math.min(rm.streamAttempt + 1, 6);
+  const delay = Math.min(30_000, 1000 * 2 ** (rm.streamAttempt - 1));
+  rm.streamRetryTimer = setTimeout(() => {
+    rm.streamRetryTimer = null;
+    openStream(code);
+  }, delay);
 }
 function closeStream() {
+  rm.streamGeneration++;
+  clearTimeout(rm.streamRetryTimer);
+  rm.streamRetryTimer = null;
   if (rm.es) rm.es.close();
   rm.es = null; rm.esCode = null;
 }
@@ -101,6 +144,7 @@ function rmRefresh() {
   if (rmLiveCode && (rm.cur !== rmLiveCode || rm.role !== 'student')) rmEndLive();
   renderRmStatus();
   if (rmRefresh.groupsDraw) rmRefresh.groupsDraw();
+  if (rmRefresh.micDraw) rmRefresh.micDraw();
 }
 
 async function rmAct(body) {
@@ -114,15 +158,33 @@ async function rmAct(body) {
 }
 
 /* ---------- মেনু স্ট্যাটাস বক্স ---------- */
+function privateHostLink(code) {
+  const token = rm.sessions[code];
+  return token ? `${location.origin}${location.pathname}${location.search}#host=${encodeURIComponent(token)}` : '';
+}
+async function copyText(text, success) {
+  try { await navigator.clipboard.writeText(text); toast(success); }
+  catch { toast('কপি করা যায়নি। ব্রাউজার অনুমতি দেখুন।'); }
+}
 function renderRmStatus() {
-  const box = $('#rmStatus'); if (!box) return;
+  const box = $('#rmStatus');
   const v = curView();
+  const badge = $('#roomLiveBadge');
+  if (badge) {
+    badge.hidden = !v;
+    badge.textContent = v ? `${v.status === 'ended' ? 'শেষ' : rm.online ? 'লাইভ' : 'পুনঃসংযোগ'} · ${(v.members || []).length} জন` : '';
+    badge.dataset.role = rm.role || '';
+  }
+  if (!box) return;
   box.replaceChildren(
+    h('div', { class: 'rm-line' }, h('b', {}, 'অ্যাক্সেস: '), v && isOwner(v) ? 'ব্যক্তিগত শিক্ষক লিংক' : 'রুম কোড দিয়ে অতিথি প্রবেশ'),
     h('div', { class: 'rm-line' }, h('b', {}, 'রোল: '), roleName(rm.role)),
     h('div', { class: 'rm-line' }, h('b', {}, 'রুম: '),
       v ? `${v.name} (${v.code})${v.status === 'ended' ? ' — শেষ' : ''}` : 'কোনো রুম নেই'),
     v && v.you && v.you.groupId ? h('div', { class: 'rm-line' }, h('b', {}, 'গ্রুপ: '), (v.groups.find(g => g.id === v.you.groupId) || {}).name || '—') : null,
-    h('div', { class: 'rm-line' }, h('small', {}, rm.online ? '● সার্ভার সংযুক্ত' : '○ সার্ভারে সংযোগ নেই')),
+    h('div', { class: 'rm-line' }, h('small', { class: rm.online ? 'connection online' : 'connection offline' }, rm.online ? '● সার্ভার সংযুক্ত' : '○ সার্ভারে সংযোগ নেই')),
+    v && isOwner(v) ? h('button', { class: 'chip', onclick: () => copyText(privateHostLink(v.code), 'ব্যক্তিগত শিক্ষক লিংক কপি হয়েছে') }, icon('share'), 'শিক্ষক লিংক কপি') : null,
+    v ? h('button', { class: 'chip', onclick: () => copyText(v.code, 'রুম কোড কপি হয়েছে') }, icon('copy'), 'রুম কোড কপি') : null,
     h('button', { class: 'chip', onclick: () => { closeUI(); roleDialog(); } }, 'রোল বদলান')
   );
 }
@@ -169,15 +231,21 @@ async function roomCreate() {
   const who = await askName() || 'শিক্ষক';
   try {
     const r = await api('/api/rooms', { name, memberName: who });
+    rm.sessions[r.room.code] = r.sessionToken;
     rm.mem[r.room.code] = r.memberId; rm.cur = r.room.code;
+    rm.role = 'teacher'; document.body.dataset.role = 'teacher';
     setView(r.room);
     openStream(r.room.code);
     rmPersist();
+    const hostLink = privateHostLink(r.room.code);
     await modal({
-      title: 'রুম তৈরি হয়েছে',
-      body: [h('p', {}, 'এই কোডটি শিক্ষার্থীদের দিন:'), h('div', { class: 'rm-code' }, r.room.code),
-        h('p', { class: 'hint' }, 'শিক্ষার্থীরা মেনু → "রুমে যোগ দিন" থেকে যেকোনো জায়গা থেকে এই কোড দিয়ে ঢুকবে।')],
-      buttons: [{ text: 'কোড কপি', icon: 'copy', act: c => { navigator.clipboard?.writeText(r.room.code).then(() => toast('কোড কপি হয়েছে')).catch(() => toast('কপি করা যায়নি')); c(true); } },
+      title: 'লাইভ ক্লাস তৈরি হয়েছে',
+      body: [h('p', {}, 'শিক্ষার্থীদের জন্য রুম কোড'), h('div', { class: 'rm-code' }, r.room.code),
+        h('p', { class: 'hint' }, 'শিক্ষার্থীরা সাইন-আপ ছাড়াই কোড দিয়ে যুক্ত হবে। বোর্ড তাদের স্ক্রিনে লাইভ আপডেট হবে।'),
+        h('p', { class: 'hint host-warning' }, 'শিক্ষক লিংকটি ব্যক্তিগত। শুধু আপনার ডিভাইসে খুলতে বা নিজের কাছে সংরক্ষণ করতে ব্যবহার করুন।'),
+        h('input', { class: 'inp host-link', value: hostLink, readonly: true, 'aria-label': 'ব্যক্তিগত শিক্ষক লিংক' })],
+      buttons: [{ text: 'কোড কপি', icon: 'copy', act: c => copyText(r.room.code, 'রুম কোড কপি হয়েছে').then(() => c(true)) },
+        { text: 'শিক্ষক লিংক কপি', icon: 'share', act: c => copyText(hostLink, 'ব্যক্তিগত শিক্ষক লিংক কপি হয়েছে').then(() => c(true)) },
         { text: 'ঠিক আছে', val: true, cls: 'pri' }]
     });
   } catch (e) { toast(e.message, 4000); }
@@ -190,9 +258,12 @@ async function roomJoin() {
   const name = await askName() || 'অজ্ঞাত';
   try {
     const r = await api('/api/rooms/join', {
-      code, name, role: rm.role || 'student', memberId: rm.mem[code] || undefined
+      code, name, role: 'student', memberId: rm.mem[code] || undefined
     });
+    rm.sessions[code] = r.sessionToken;
     rm.mem[code] = r.memberId; rm.cur = code;
+    rm.role = r.room.you?.isOwner ? 'teacher' : 'student';
+    document.body.dataset.role = rm.role;
     setView(r.room);
     openStream(code);
     if (r.room.groups.length && !r.room.you.groupId) await chooseGroup();
@@ -269,6 +340,53 @@ async function roomGroups() {
   draw();
   try { await modal({ title: 'গ্রুপ ও সদস্য', body, buttons: [{ text: 'বন্ধ', val: null }] }); }
   finally { rmRefresh.groupsDraw = null; }
+}
+
+/* ---------- শিক্ষক-নিয়ন্ত্রিত কথা বলার অনুরোধ ---------- */
+async function roomMic() {
+  const initial = curView();
+  if (!initial) return toast('আগে একটি রুম বেছে নিন');
+  const body = h('div', { class: 'plist' });
+  const owner = isOwner(initial);
+  const draw = () => {
+    const v = curView() || initial;
+    const mic = v.mic || { queue: [], grant: null, mediaAvailable: false };
+    body.replaceChildren();
+    if (owner) {
+      body.append(h('p', { class: 'hint' }, 'এক সময়ে একজন শিক্ষার্থীকে অনুমতি দেওয়া হয়। শিক্ষক চাইলে যেকোনো সময় অনুমতি বাতিল করতে পারবেন।'));
+      if (mic.grant) {
+        body.append(h('div', { class: 'prow' },
+          h('div', { class: 'pmain' }, h('b', {}, `${mic.grant.name} — অনুমতি অপেক্ষমাণ`), h('span', {}, 'লাইভ অডিও/ভিডিও সংযুক্ত নেই; কোনো অডিও প্রকাশিত হচ্ছে না।')),
+          h('button', { class: 'chip danger', onclick: async () => { await rmAct({ type: 'mic.revoke', target: mic.grant.memberId }); draw(); } }, 'অনুমতি বাতিল')));
+      }
+      if (!mic.queue.length) body.append(h('p', { class: 'hint' }, 'কেউ হাত তোলেনি।'));
+      for (const member of mic.queue) {
+        body.append(h('div', { class: 'prow' },
+          h('div', { class: 'pmain' }, h('b', {}, member.name), h('span', {}, 'কথা বলার অনুরোধ')),
+          h('button', { class: 'chip pri', disabled: !!mic.grant, onclick: async () => { await rmAct({ type: 'hand.approve', target: member.id }); draw(); } }, 'অনুমতি দিন'),
+          h('button', { class: 'chip', onclick: async () => { await rmAct({ type: 'hand.dismiss', target: member.id }); draw(); } }, 'বাদ দিন')));
+      }
+      if (!mic.mediaAvailable) body.append(h('p', { class: 'hint' }, 'লাইভ অডিও/ভিডিও প্রকাশনা নিষ্ক্রিয়: LiveKit server credentials যোগ না হওয়া পর্যন্ত অনুমোদন শুধু queue-তে থাকবে।'));
+    } else {
+      const status = v.you?.micStatus || 'idle';
+      const statusText = {
+        idle: 'আপনি এখনো কথা বলার অনুরোধ করেননি।',
+        hand_raised: 'আপনার অনুরোধ শিক্ষকের queue-তে আছে।',
+        approved_waiting: 'শিক্ষক অনুমতি দিয়েছেন। লাইভ অডিও সংযুক্ত না থাকায় এখনো কোনো অডিও পাঠানো হচ্ছে না।',
+        permission_ready: 'মাইক্রোফোন অনুমতি প্রস্তুত, কিন্তু live audio connection নেই।',
+        revoked: 'শিক্ষক অনুমতি বাতিল করেছেন। চাইলে আবার হাত তুলুন।'
+      }[status] || 'কথা বলার অনুরোধের অবস্থা পাওয়া যায়নি।';
+      body.append(h('p', { class: 'hint' }, statusText));
+      if (status !== 'approved_waiting' && status !== 'permission_ready') {
+        body.append(h('button', { class: 'chip pri', onclick: async () => { await rmAct({ type: status === 'hand_raised' ? 'hand.lower' : 'hand.raise' }); draw(); } }, status === 'hand_raised' ? 'হাত নামান' : status === 'revoked' ? 'আবার হাত তুলুন' : 'হাত তুলুন'));
+      }
+      body.append(h('p', { class: 'hint' }, 'অনুমতি ছাড়া মাইক্রোফোন প্রকাশ হয় না। LiveKit credentials যোগ না হওয়া পর্যন্ত এই রুমে audio/video broadcasting বন্ধ আছে।'));
+    }
+  };
+  rmRefresh.micDraw = draw;
+  draw();
+  try { await modal({ title: owner ? 'হাত তোলা ও মাইক নিয়ন্ত্রণ' : 'কথা বলার অনুরোধ', body, buttons: [{ text: 'বন্ধ', val: null }] }); }
+  finally { rmRefresh.micDraw = null; }
 }
 
 /* ---------- ক্লাস টাইমার ---------- */
@@ -424,6 +542,7 @@ const RM_MENU_BLOCK = [
   { id: 'roomJoin', icon: 'share', text: 'রুমে যোগ দিন (কোড দিয়ে)' },
   { id: 'roomMine', icon: 'folder', text: 'আমার রুমসমূহ' },
   { id: 'roomGroups', icon: 'grid', text: 'গ্রুপ ও সদস্য ব্যবস্থাপনা' },
+  { id: 'roomMic', icon: 'share', text: 'হাত তোলা ও মাইক অনুমতি' },
   { sec: 'ক্লাসের সরঞ্জাম' },
   { id: 'timer', icon: 'play', text: 'ক্লাস টাইমার' }
 ];
@@ -436,7 +555,7 @@ function rmInjectMenu() {
   MENU.splice(MENU.findIndex(m => m.id === 'about'), 0, { id: 'help', icon: 'info', text: 'সাহায্য: কিভাবে ব্যবহার করবেন' });
 }
 const RM_ACTS = {
-  roleSwitch: roleDialog, roomCreate, roomJoin, roomMine, roomGroups,
+  roleSwitch: roleDialog, roomCreate, roomJoin, roomMine, roomGroups, roomMic,
   timer: timerDialog, install: installApp,
   help: () => modal({ title: 'সাহায্য', body: [
     h('p', {}, '১. রোল: শিক্ষক হলে রুম ও গ্রুপ বানাবেন। শিক্ষার্থী হলে রুম কোড দিয়ে যোগ দেবেন।'),
@@ -445,6 +564,35 @@ const RM_ACTS = {
     h('p', {}, '৪. বোর্ডের লেখা এখনো এই ডিভাইসেই সংরক্ষিত — নিয়মিত "ব্যাকআপ ফাইল সংরক্ষণ" করুন।')
   ], buttons: [{ text: 'ঠিক আছে', val: true, cls: 'pri' }] })
 };
+
+async function restoreHostLink() {
+  const token = new URLSearchParams(location.hash.slice(1)).get('host');
+  if (!token) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  try {
+    const encoded = token.split('.')[1];
+    const payload = JSON.parse(atob(encoded.replace(/-/g, '+').replace(/_/g, '/')));
+    if (payload.type !== 'classroom' || payload.role !== 'teacher' || !/^[A-Z0-9]{4,16}$/.test(payload.roomCode) || typeof payload.memberId !== 'string') throw new Error('লিংকটি সঠিক নয়।');
+    const code = payload.roomCode;
+    rm.sessions[code] = token;
+    rm.mem[code] = payload.memberId;
+    rm.cur = code;
+    rm.role = 'teacher';
+    document.body.dataset.role = 'teacher';
+    rmPersist();
+    const response = await api('/api/rooms/join', { code, name: rm.name || 'শিক্ষক', role: 'teacher', memberId: payload.memberId });
+    if (!response.room.you?.isOwner) throw new Error('লিংকটি শিক্ষক অনুমতি দেয় না।');
+    rm.sessions[code] = response.sessionToken;
+    rm.mem[code] = response.memberId;
+    setView(response.room);
+    openStream(code);
+    toast(`শিক্ষক হিসেবে "${response.room.name}" ক্লাসে যুক্ত হয়েছেন`);
+  } catch (error) {
+      rm.role = 'student';
+      document.body.dataset.role = 'student';
+      toast(error.message || 'শিক্ষক লিংকটি যাচাই করা যায়নি।', 4000);
+  }
+}
 
 function rmInitUI() {
   for (const id of RM_EDIT_ONLY) { const el = document.getElementById('mi-' + id); if (el) el.classList.add('ed'); }
@@ -457,11 +605,15 @@ function rmInitUI() {
     return orig(id);
   };
   if (rmBC) rmBC.onmessage = e => { /* অন্য ট্যাব বদলালে: লোকাল ক্যাশ নতুন করে নেওয়া */ rmLoad(); rmRefresh(); };
+  const hostLaunch = new URLSearchParams(location.hash.slice(1)).has('host');
+  if (hostLaunch) restoreHostLink();
   document.body.dataset.role = rm.role || 'teacher';
-  if (rm.cur && rm.mem[rm.cur]) openStream(rm.cur);
+  if (!hostLaunch && rm.cur && rm.mem[rm.cur]) openStream(rm.cur);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && rm.cur) openStream(rm.cur); });
+  window.addEventListener('online', () => { rm.online = true; rmRefresh(); if (rm.cur) openStream(rm.cur); });
+  window.addEventListener('offline', () => { rm.online = false; rmRefresh(); });
   renderRmStatus();
-  if (!rm.role) setTimeout(roleDialog, 600);
+  if (!rm.role && !hostLaunch) setTimeout(roleDialog, 600);
 }
 
 /* বোর্ড বদল / পাতা বদল হলে শিক্ষকের স্ন্যাপশট পাঠানো */

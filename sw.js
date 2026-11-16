@@ -2,10 +2,10 @@
    - অ্যাপ কোড (HTML/CSS/JS): network-first → আপডেট সবসময় পৌঁছায়, অফলাইনে ক্যাশ
    - ফন্ট/OCR/PDF লাইব্রেরি/আইকন: cache-first (বড় ফাইল, বদলায় না)
    নতুন রিলিজে VER বাড়ান → পুরোনো ক্যাশ মুছে যাবে। */
-const VER = 'sb-v5';
+const VER = 'sb-v8';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/style.css',
-  'js/util.js', 'js/db.js', 'js/render.js', 'js/app.js', 'js/ui.js', 'js/rooms.js', 'js/features.js',
+  'css/tailwind.generated.css', 'js/util.js', 'js/db.js', 'js/render.js', 'js/app.js', 'js/ui.js', 'js/rooms.js', 'js/features.js',
   'fonts/NotoSansBengali-Regular.ttf', 'fonts/NotoSansBengali-Bold.ttf',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png',
   'vendor/pdf.min.mjs', 'vendor/pdf.worker.min.mjs', 'vendor/pdf-lib.min.js'

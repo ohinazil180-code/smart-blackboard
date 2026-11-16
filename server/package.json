@@ -2,9 +2,25 @@
   "name": "smart-blackboard-server",
   "version": "2.0.0",
   "private": true,
-  "description": "স্মার্ট ব্ল্যাকবোর্ড — রুম সার্ভার ও স্ট্যাটিক হোস্ট (কোনো নির্ভরতা নেই)",
+  "description": "স্মার্ট ব্ল্যাকবোর্ড — Neon-ভিত্তিক ক্লাসরুম API ও স্ট্যাটিক হোস্ট",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
-  "license": "UNLICENSED"
+  "scripts": {
+    "build:styles": "tailwindcss -i ../css/tailwind.css -o ../css/tailwind.generated.css --minify",
+    "prestart": "pnpm run build:styles",
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "dotenv": "^18.0.10",
+    "drizzle-orm": "^0.45.4",
+    "jose": "^6.2.17",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.5"
+  }
 }

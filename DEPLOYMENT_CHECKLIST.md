@@ -8,5 +8,12 @@
 - [ ] আপডেটের পর sw.js-এর VER বাড়ানো
 - [ ] ব্রাউজারের "স্টোরেজ পূর্ণ" সতর্কতা থাকলে পুরোনো নোট আর্কাইভ/এক্সপোর্ট করা
 
-## PRD V4-এর যেসব অংশ এই প্যাকেজে নেই
-PRD-তে বর্ণিত পূর্ণাঙ্গ অনলাইন ক্লাসরুম (ব্যবহারকারী লগইন, শিক্ষক/শিক্ষার্থী রোল, রুম কোড, লাইভ ভিডিও/অডিও WebRTC-SFU, সার্ভার-সাইড মাইক গ্রান্ট, Raise Hand কিউ, চ্যাট, পোল, কুইজ, অ্যাটেনডেন্স রিপোর্ট, PostgreSQL/Redis ব্যাকএন্ড) একটি আলাদা backend প্রজেক্ট। সেটি তৈরি করতে সার্ভার, ডাটাবেস ও নিরাপত্তা পরীক্ষার জন্য আলাদা বাজেট ও ডেভেলপার টিম লাগবে। এই প্যাকেজ সেই ভিত্তি (UI, বোর্ড, PDF, OCR, অফলাইন) প্রদান করে।
+## এখন কার্যকর ক্লাসরুম
+Teacher private link দিয়ে নিজের room পুনরায় খুলতে পারেন; শিক্ষার্থীরা room code ও display name দিয়ে account ছাড়াই ঢোকে। Neon-backed room state, teacher-only board publishing, student read-only view, reconnect snapshot, group/participant controls, raise-hand queue এবং teacher mic approval API বাস্তবে কাজ করে।
+
+## এই সংস্করণে নেই
+- Live audio/video publishing: SFU/media server credentials ও signaling service configured নয়; microphone control queue-তে অনুমতির workflow மட்டுமே পরিচালিত হয়.
+- Classroom chat, polls, quizzes, attendance reports, scheduled classes, waiting-room admit controls.
+- Board notebook cloud persistence: personal notebook IndexedDB-তে থাকে; teacher board live class room-এ synced হয়, কিন্তু room ended/expired হলে notebook archive হিসেবে থাকে না.
+
+Deploy করার আগে browser-এর বাইরে দুটি session/device দিয়ে teacher link, student code join, board updates, refresh/reconnect এবং role restrictions যাচাই করুন।

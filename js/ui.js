@@ -386,6 +386,7 @@ function showOcrResult(text, rect) {
 /* ---------- টেক্সট বক্স ---------- */
 async function editText(idx, x, y) {
   const p = S.page, ex = idx >= 0 ? p.items[idx] : null;
+  if (ex?.locked) return toast('লেখাটি সুরক্ষিত — আগে আনলক করুন');
   const st = { size: ex ? ex.size : S.sizes.text, color: ex ? ex.color : S.color, bold: !!(ex && ex.bold), glow: !!(ex && ex.glow), align: (ex && ex.align) || 'left' };
   const ta = h('textarea', { class: 'inp ta', rows: 4, placeholder: 'এখানে লিখুন… (বাংলা / English)' });
   ta.value = ex ? ex.text : '';
@@ -510,9 +511,42 @@ async function aboutDialog() {
   });
 }
 
+/* ---------- সিস্টেম-সচেতন থিম ---------- */
+const themePreference = () => { try { return localStorage.getItem('sb.theme') || 'system'; } catch (_) { return 'system'; } };
+function applyTheme(preference, animate = false) {
+  const root = document.documentElement;
+  root.dataset.theme = preference;
+  root.style.colorScheme = preference === 'system' ? '' : preference;
+  const button = $('#themeToggle');
+  if (button) {
+    const labels = { system: 'সিস্টেম থিম (এখন বদলাতে চাপুন)', light: 'লাইট থিম (এখন বদলাতে চাপুন)', dark: 'ডার্ক থিম (এখন বদলাতে চাপুন)' };
+    button.setAttribute('aria-label', labels[preference]);
+    button.title = labels[preference];
+    button.dataset.mode = preference;
+  }
+  if (animate) {
+    root.classList.add('theme-transition');
+    window.setTimeout(() => root.classList.remove('theme-transition'), 500);
+  }
+}
+function initTheme() {
+  applyTheme(themePreference());
+  $('#themeToggle').onclick = cycleTheme;
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => {
+    if (themePreference() === 'system') applyTheme('system', true);
+  });
+}
+function cycleTheme() {
+  const current = themePreference();
+  const next = current === 'system' ? 'light' : current === 'light' ? 'dark' : 'system';
+  try { localStorage.setItem('sb.theme', next); } catch (_) { }
+  applyTheme(next, true);
+}
+
 /* ---------- ইভেন্ট বাইন্ডিং ---------- */
 let deferredInstall = null;
 function bindUI() {
+  initTheme();
   $('#btnMenu').onclick = openMenu;
   $('#projTitle').onclick = projectsDialog;
   els.btnPrev.onclick = () => goPage(-1); els.btnNext.onclick = () => goPage(1);
@@ -530,6 +564,7 @@ function bindUI() {
   $('#customColor').oninput = e => setColor(e.target.value);
   els.size.oninput = () => onSizeInput(false); els.size.onchange = () => onSizeInput(true);
   $('#selEdit').onclick = () => editText(S.sel, 0, 0);
+  $('#selLock').onclick = toggleSelLock;
   $('#selDup').onclick = dupSel; $('#selDel').onclick = deleteSel;
   $('#selDone').onclick = () => { S.sel = -1; updateSelBar(); drawOv(); };
   $('#busyCancel').onclick = () => busyCancel && busyCancel();

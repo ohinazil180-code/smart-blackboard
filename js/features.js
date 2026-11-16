@@ -311,14 +311,26 @@ function buildExtraColors() {
 function fxMutate(fn) {
   const p = S.page;
   if (S.sel < 0 || !p.items[S.sel]) return toast('আগে একটি লেখা, ছবি বা আকৃতি নির্বাচন করুন');
+  if (p.items[S.sel].locked) return toast('অবজেক্টটি সুরক্ষিত — আগে আনলক করুন');
   const n = { ...p.items[S.sel] };
   fn(n);
   p.items[S.sel] = n;
   commit(); redrawInk(); drawOv(); updateSelBar();
 }
+function moveLayer(direction) {
+  const page = S.page, index = S.sel;
+  if (!page || index < 0 || !page.items[index]) return;
+  const next = direction === 'front' ? page.items.length - 1 : 0;
+  if (index === next) return toast(direction === 'front' ? 'অবজেক্টটি সামনেই আছে' : 'অবজেক্টটি পেছনেই আছে');
+  const [item] = page.items.splice(index, 1);
+  page.items.splice(next, 0, item);
+  S.sel = next;
+  commit(); redrawInk(); drawOv(); updateSelBar();
+}
 function buildEditRow() {
   const dock = $('#opts'); if (!dock || $('#rowEdit')) return;
-  const b = (label, aria, fn) => h('button', { class: 'chip', 'aria-label': aria, onclick: () => fxMutate(fn) }, label);
+  const b = (label, aria, fn) => h('button', { class: 'chip', 'aria-label': aria, title: aria, onclick: () => fxMutate(fn) }, label);
+  const action = (label, aria, fn) => h('button', { class: 'chip', 'aria-label': aria, title: aria, onclick: fn }, label);
   const row = h('div', { class: 'orow', id: 'rowEdit', hidden: true },
     b('B', 'বোল্ড', it => { if (it.t === 'text') it.bold = !it.bold; }),
     b('I', 'ইটালিক', it => { if (it.t === 'text') it.it = !it.it; }),
@@ -326,8 +338,13 @@ function buildEditRow() {
     b('⇥', 'মাঝে', it => { if (it.t === 'text') it.align = 'center'; }),
     b('A+', 'বড়', it => { if (it.t === 'text') it.size = Math.min(160, (it.size || 44) + 4); }),
     b('A−', 'ছোট', it => { if (it.t === 'text') it.size = Math.max(10, (it.size || 44) - 4); }),
-    b('↻', 'ঘোরান', it => { if (it.t === 'pic') it.rot = ((it.rot || 0) + Math.PI / 2) % (Math.PI * 2); }),
-    b('↔', 'উল্টাও', it => { if (it.t === 'pic') it.flip = !it.flip; })
+    b('↶', '১৫° বাঁ দিকে ঘোরান', it => { if (SHAPES.has(it.t) || it.t === 'text') it.rot = (it.rot || 0) - Math.PI / 12; }),
+    b('↷', '১৫° ডান দিকে ঘোরান', it => { if (SHAPES.has(it.t) || it.t === 'text') it.rot = (it.rot || 0) + Math.PI / 12; }),
+    b('ভরাট', 'শেপ ভরাট চালু বা বন্ধ', it => { if (SHAPES.has(it.t) && !['line', 'arrow'].includes(it.t)) it.fill = !it.fill; }),
+    action('↟', 'সবার সামনে আনুন', () => moveLayer('front')),
+    action('↡', 'পেছনে পাঠান', () => moveLayer('back')),
+    b('↻', 'ছবি ঘোরান', it => { if (it.t === 'pic') it.rot = ((it.rot || 0) + Math.PI / 2) % (Math.PI * 2); }),
+    b('↔', 'ছবি উল্টান', it => { if (it.t === 'pic') it.flip = !it.flip; })
   );
   dock.insertBefore(row, $('#rowColor'));
 }
@@ -335,7 +352,16 @@ const _updateOpts = updateOpts;
 updateOpts = function () {
   _updateOpts();
   const sel = S.sel >= 0 ? S.page && S.page.items[S.sel] : null;
-  const r = $('#rowEdit'); if (r) r.hidden = !(sel && (sel.t === 'text' || sel.t === 'pic'));
+  const r = $('#rowEdit'); if (r) r.hidden = !(sel && !sel.locked && (sel.t === 'text' || sel.t === 'pic' || SHAPES.has(sel.t)));
+  if (r) {
+    const canFill = !!(sel && SHAPES.has(sel.t) && !['line', 'arrow'].includes(sel.t));
+    r.querySelector('[aria-label="শেপ ভরাট চালু বা বন্ধ"]')?.toggleAttribute('hidden', !canFill);
+    r.querySelector('[aria-label="ছবি ঘোরান"]')?.toggleAttribute('hidden', sel?.t !== 'pic');
+    r.querySelector('[aria-label="ছবি উল্টান"]')?.toggleAttribute('hidden', sel?.t !== 'pic');
+    r.querySelectorAll('[aria-label="১৫° বাঁ দিকে ঘোরান"], [aria-label="১৫° ডান দিকে ঘোরান"]').forEach(button => button.hidden = !(sel && (SHAPES.has(sel.t) || sel.t === 'text')));
+    r.querySelectorAll('[aria-label="সবার সামনে আনুন"], [aria-label="পেছনে পাঠান"]').forEach(button => button.hidden = !sel);
+    r.querySelectorAll('[aria-label="বোল্ড"], [aria-label="ইটালিক"], [aria-label="বামে"], [aria-label="মাঝে"], [aria-label="বড়"], [aria-label="ছোট"]').forEach(button => button.hidden = sel?.t !== 'text');
+  }
   const pk = $('#rowPenKind'); if (pk) pk.hidden = S.tool !== 'pen';
 };
 
@@ -434,4 +460,26 @@ function fxInit2() {
     return _menuAct2(id);
   };
 }
+const drawItemBeforeRotation = drawItem;
+drawItem = function (ctx, item, overlay) {
+  if (!(SHAPES.has(item.t) || item.t === 'text') || !item.rot) return drawItemBeforeRotation(ctx, item, overlay);
+  const box = itemBox(item), cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(item.rot);
+  ctx.translate(-cx, -cy);
+  drawItemBeforeRotation(ctx, item, overlay);
+  ctx.restore();
+};
+
+const itemHitBeforeRotation = itemHit;
+itemHit = function (item, x, y, radius) {
+  if (!(SHAPES.has(item.t) || item.t === 'text') || !item.rot) return itemHitBeforeRotation(item, x, y, radius);
+  const box = itemBox(item), cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+  const dx = x - cx, dy = y - cy, angle = -item.rot;
+  const localX = cx + dx * Math.cos(angle) - dy * Math.sin(angle);
+  const localY = cy + dx * Math.sin(angle) + dy * Math.cos(angle);
+  return itemHitBeforeRotation(item, localX, localY, radius);
+};
+
 window.addEventListener('DOMContentLoaded', () => setTimeout(() => { try { fxInit2(); } catch (e) { console.error('features2', e); } }, 20));
