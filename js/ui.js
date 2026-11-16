@@ -510,9 +510,42 @@ async function aboutDialog() {
   });
 }
 
+/* ---------- সিস্টেম-সচেতন থিম ---------- */
+const themePreference = () => { try { return localStorage.getItem('sb.theme') || 'system'; } catch (_) { return 'system'; } };
+function applyTheme(preference, animate = false) {
+  const root = document.documentElement;
+  root.dataset.theme = preference;
+  root.style.colorScheme = preference === 'system' ? '' : preference;
+  const button = $('#themeToggle');
+  if (button) {
+    const labels = { system: 'সিস্টেম থিম (এখন বদলাতে চাপুন)', light: 'লাইট থিম (এখন বদলাতে চাপুন)', dark: 'ডার্ক থিম (এখন বদলাতে চাপুন)' };
+    button.setAttribute('aria-label', labels[preference]);
+    button.title = labels[preference];
+    button.dataset.mode = preference;
+  }
+  if (animate) {
+    root.classList.add('theme-transition');
+    window.setTimeout(() => root.classList.remove('theme-transition'), 500);
+  }
+}
+function initTheme() {
+  applyTheme(themePreference());
+  $('#themeToggle').onclick = cycleTheme;
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => {
+    if (themePreference() === 'system') applyTheme('system', true);
+  });
+}
+function cycleTheme() {
+  const current = themePreference();
+  const next = current === 'system' ? 'light' : current === 'light' ? 'dark' : 'system';
+  try { localStorage.setItem('sb.theme', next); } catch (_) { }
+  applyTheme(next, true);
+}
+
 /* ---------- ইভেন্ট বাইন্ডিং ---------- */
 let deferredInstall = null;
 function bindUI() {
+  initTheme();
   $('#btnMenu').onclick = openMenu;
   $('#projTitle').onclick = projectsDialog;
   els.btnPrev.onclick = () => goPage(-1); els.btnNext.onclick = () => goPage(1);
