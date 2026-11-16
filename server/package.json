@@ -5,8 +5,8 @@
   "description": "স্মার্ট ব্ল্যাকবোর্ড — Neon-ভিত্তিক ক্লাসরুম API ও স্ট্যাটিক হোস্ট",
   "main": "server.js",
   "scripts": {
-    "build:auth-client": "node build-auth-client.js",
-    "prestart": "pnpm run build:auth-client",
+    "build:styles": "tailwindcss -i ../css/tailwind.css -o ../css/tailwind.generated.css --minify",
+    "prestart": "pnpm run build:styles",
     "start": "node server.js",
     "test": "node --test"
   },
@@ -21,7 +21,6 @@
     "pg": "^8.23.1"
   },
   "devDependencies": {
-    "@neon/neon-js": "^0.10.2",
-    "esbuild": "^0.28.2"
+    "@tailwindcss/cli": "^4.3.5"
   }
 }

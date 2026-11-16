@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+@source "../index.html";
+@source "../js";
+
+@theme {
+  --color-classroom-ink: #183b3a;
+  --color-classroom-teal: #0f766e;
+  --color-classroom-mint: #d8f1eb;
+  --font-bengali: "Noto Sans Bengali", system-ui, sans-serif;
+}

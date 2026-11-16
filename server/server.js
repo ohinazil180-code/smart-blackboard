@@ -29,7 +29,6 @@ const CODE_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // অস্পষ্ট 
 const rooms = new Map();      // code -> room
 const streams = new Map();    // code -> Set<{res, memberId}>
 const streamTickets = new Map();
-let authVerifierPromise = null;
 const rateBuckets = new Map(); // ip:bucket -> {n, reset}
 const joinFails = new Map();   // ip -> {n, reset}
 const SECURITY_HEADERS = Object.freeze({
@@ -168,26 +167,33 @@ const validRole = r => r === 'teacher' || r === 'student';
 const now = () => Date.now();
 function touch(room) { room.updatedAt = now(); markDirty(); }
 
+const roomSessionSecret = () => process.env.ROOM_SESSION_SECRET || process.env.BETTER_AUTH_SECRET || '';
+
+async function issueRoomToken(roomCode, userId, memberId, role) {
+  const secret = roomSessionSecret();
+  if (secret.length < 32) throw Object.assign(new Error('রুম সেশন সুরক্ষার কনফিগারেশন নেই।'), { status: 503 });
+  const { SignJWT } = await import('jose');
+  return new SignJWT({ type: 'classroom', roomCode, memberId, role })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setSubject(userId)
+    .setIssuedAt()
+    .setExpirationTime('30d')
+    .sign(new TextEncoder().encode(secret));
+}
+
 async function authenticate(req) {
   const token = /^Bearer ([A-Za-z0-9._~-]+)$/.exec(req.headers.authorization || '')?.[1];
-  const baseUrl = process.env.NEON_AUTH_BASE_URL;
-  if (!token || !baseUrl) return null;
-  const jwksUrl = process.env.NEON_AUTH_JWKS_URL || `${baseUrl.replace(/\/+$/, '')}/.well-known/jwks.json`;
+  const secret = roomSessionSecret();
+  if (!token || secret.length < 32) return null;
   try {
-    if (!authVerifierPromise) {
-      authVerifierPromise = import('jose').then(({ createRemoteJWKSet, jwtVerify }) => ({
-        jwks: createRemoteJWKSet(new URL(jwksUrl)),
-        jwtVerify
-      }));
-    }
-    const { jwks, jwtVerify } = await authVerifierPromise;
-    const { payload } = await jwtVerify(token, jwks, { algorithms: ['EdDSA'] });
-    if (typeof payload.sub !== 'string' || payload.role !== 'authenticated') return null;
-    return { id: payload.sub, email: typeof payload.email === 'string' ? payload.email : null };
+    const { jwtVerify } = await import('jose');
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(secret), { algorithms: ['HS256'] });
+    if (payload.type !== 'classroom' || typeof payload.sub !== 'string' || !/^[A-Z0-9]{4,16}$/.test(payload.roomCode) || typeof payload.memberId !== 'string' || !['teacher', 'student'].includes(payload.role)) return null;
+    return { id: payload.sub, roomCode: payload.roomCode, memberId: payload.memberId, role: payload.role };
   } catch (error) {
     if (/^(JWT|JWS|JWKS|JOSE)/.test(error?.name || '')) return null;
-    console.error('[auth] verification unavailable:', error?.name || 'Error');
-    throw Object.assign(new Error('অ্যাকাউন্ট যাচাই করা যাচ্ছে না।'), { status: 503 });
+    console.error('[room-session] verification unavailable:', error?.name || 'Error');
+    throw Object.assign(new Error('রুম সেশন যাচাই করা যাচ্ছে না।'), { status: 503 });
   }
 }
 function resolveRoomMember(room, userId, claimedMemberId) {
@@ -299,22 +305,25 @@ async function apiCreate(req, res, ip, user) {
   const b = await readJSON(req);
   const name = clean(b.name, 80), memberName = clean(b.memberName, 60) || 'শিক্ষক';
   if (!name) return fail(res, 400, 'রুমের নাম দিন।');
+  const teacher = user || { id: crypto.randomUUID() };
   const ownerId = rid();
   const room = {
     code: newCode(), name, status: 'live', ownerId, createdAt: now(), updatedAt: now(),
     groups: [{ id: rid(), name: 'গ্রুপ ১' }, { id: rid(), name: 'গ্রুপ ২' }],
-    members: [{ id: ownerId, userId: user.id, name: memberName, role: 'teacher', groupId: null, joinedAt: now(), micStatus: 'idle' }],
+    members: [{ id: ownerId, userId: teacher.id, name: memberName, role: 'teacher', groupId: null, joinedAt: now(), micStatus: 'idle' }],
     mic: { queue: [], grant: null }
   };
   touch(room);
   let inserted = false;
+  let sessionToken = '';
   for (let attempt = 0; attempt < 4; attempt++) {
     room.code = newCode();
+    sessionToken = await issueRoomToken(room.code, teacher.id, ownerId, 'teacher');
     if (await insertRoom(room)) { inserted = true; break; }
   }
   if (!inserted) return fail(res, 503, 'এখন রুম তৈরি করা যাচ্ছে না।');
   rooms.set(room.code, room);
-  send(res, 201, { memberId: ownerId, room: viewFor(room, ownerId) });
+  send(res, 201, { memberId: ownerId, sessionToken, room: viewFor(room, ownerId) });
 }
 
 async function apiJoin(req, res, ip, user) {
@@ -322,24 +331,28 @@ async function apiJoin(req, res, ip, user) {
   if (!rateOk(ip, 'join', 60, 60e3)) return fail(res, 429, 'খুব দ্রুত অনুরোধ হচ্ছে।');
   const b = await readJSON(req);
   const code = clean(b.code, 16).toUpperCase().replace(/\s/g, '');
+  if (user?.roomCode && user.roomCode !== code) return fail(res, 403, 'এই সেশন অন্য একটি রুমের।');
   const room = await loadRoomByInvite(code);
   if (!room) { joinFailed(ip); return fail(res, 404, 'এই কোডের রুম পাওয়া যায়নি।'); }
   if (room.status === 'ended') return fail(res, 410, 'এই রুমটি শেষ হয়ে গেছে।');
+  const identity = user || { id: crypto.randomUUID() };
   const name = clean(b.name, 60) || 'অজ্ঞাত';
-  let member = resolveRoomMember(room, user.id, b.memberId);
+  let member = resolveRoomMember(room, identity.id, user ? b.memberId : null);
   if (member) {
     member.name = name;
     if (member.id !== room.ownerId) member.role = 'student';
   } else {
     if (room.members.length >= MAX_MEMBERS) return fail(res, 403, 'এই রুম পূর্ণ।');
-    member = { id: rid(), userId: user.id, name, role: 'student', groupId: null, joinedAt: now(), micStatus: 'idle' };
+    member = { id: rid(), userId: identity.id, name, role: 'student', groupId: null, joinedAt: now(), micStatus: 'idle' };
     room.members.push(member);
   }
   if (b.groupId && room.groups.some(g => g.id === b.groupId)) member.groupId = b.groupId;
   touch(room);
-  await persistRoom(room, user.id, true);
+  await persistRoom(room, identity.id, true);
   broadcast(room);
-  send(res, 200, { memberId: member.id, room: viewFor(room, member.id) });
+  const role = member.id === room.ownerId ? 'teacher' : 'student';
+  const sessionToken = await issueRoomToken(room.code, identity.id, member.id, role);
+  send(res, 200, { memberId: member.id, sessionToken, room: viewFor(room, member.id) });
 }
 
 async function apiStreamTicket(req, res, code, user) {
@@ -579,22 +592,19 @@ const server = http.createServer(async (req, res) => {
 
     if (p.startsWith('/api/')) {
       if (!rateOk(ip, 'all', 300, 60e3)) return fail(res, 429, 'খুব বেশি অনুরোধ।');
-      if (req.method === 'GET' && p === '/api/config') {
-        return send(res, 200, { neonAuthUrl: process.env.NEON_AUTH_BASE_URL || '' });
-      }
       let m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/stream$/);
       if (req.method === 'GET' && m) return await apiStream(req, res, m[1], url.searchParams.get('t') || '');
 
       const user = await authenticate(req);
-      if (!user) return fail(res, 401, 'ক্লাস ফিচার ব্যবহার করতে ইমেইল দিয়ে সাইন ইন করুন।');
+      if (req.headers.authorization && !user) return fail(res, 401, 'রুম সেশনটি মেয়াদোত্তীর্ণ বা অবৈধ।');
       if (req.method === 'POST' && p === '/api/rooms') return await apiCreate(req, res, ip, user);
       if (req.method === 'POST' && p === '/api/rooms/join') return await apiJoin(req, res, ip, user);
-      m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/stream-ticket$/);
-      if (req.method === 'POST' && m) return await apiStreamTicket(req, res, m[1], user);
-      m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/board$/);
-      if (req.method === 'POST' && m) return await apiBoard(req, res, m[1], ip, user);
-      m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/act$/);
-      if (req.method === 'POST' && m) return await apiAct(req, res, m[1], ip, user);
+      if (!user) return fail(res, 401, 'রুমে যোগ দিতে কোড লিখুন।');
+      m = p.match(/^\/api\/rooms\/([A-Z0-9]{4,16})\/(stream-ticket|board|act)$/);
+      if (m && user.roomCode && user.roomCode !== m[1]) return fail(res, 403, 'এই সেশন অন্য একটি রুমের।');
+      if (req.method === 'POST' && m?.[2] === 'stream-ticket') return await apiStreamTicket(req, res, m[1], user);
+      if (req.method === 'POST' && m?.[2] === 'board') return await apiBoard(req, res, m[1], ip, user);
+      if (req.method === 'POST' && m?.[2] === 'act') return await apiAct(req, res, m[1], ip, user);
       return fail(res, 404, 'রুট নেই।');
     }
 

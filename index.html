@@ -3,15 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b0d10">
+<meta name="theme-color" content="#f4f7f6">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="description" content="ডিজিটাল স্মার্ট ব্ল্যাকবোর্ড ও PDF টিচিং স্টুডিও — কালো/সাদা বোর্ড, PDF মার্কিং, OCR, প্রেজেন্টেশন, অফলাইন।">
-<title>স্মার্ট ব্ল্যাকবোর্ড ও PDF টিচিং স্টুডিও</title>
+<title>Smart Blackboard — Live Coaching Studio</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/tailwind.generated.css">
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -61,8 +62,10 @@
 
 <div id="app">
   <header id="topbar">
-    <button class="ib" id="btnMenu" aria-label="মেনু"><svg class="ic"><use href="#i-menu"/></svg></button>
+    <div class="brand-mark flex items-center justify-center rounded-xl" aria-hidden="true"><svg class="ic"><use href="#i-board"/></svg></div>
+    <button class="ib" id="btnMenu" aria-label="ক্লাস ও নোট মেনু"><svg class="ic"><use href="#i-menu"/></svg></button>
     <button class="title" id="projTitle" aria-label="নোটের তালিকা">ক্লাস নোট</button>
+    <span id="roomLiveBadge" class="room-live-badge" hidden></span>
     <div class="save" id="saveDot" data-s="ok"><i></i><span id="saveTxt">সংরক্ষিত</span></div>
     <div class="pager">
       <button class="ib sm" id="btnPrev" aria-label="আগের পাতা"><svg class="ic"><use href="#i-prev"/></svg></button>
@@ -202,6 +205,5 @@
 <script src="js/ui.js"></script>
 <script src="js/rooms.js"></script>
 <script src="js/features.js"></script>
-<script src="js/auth-client.bundle.js"></script>
 </body>
 </html>

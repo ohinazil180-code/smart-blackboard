@@ -3,7 +3,6 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { createServer } = require('node:http');
-const { randomUUID } = require('node:crypto');
 const { mkdtempSync, rmSync } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -45,22 +44,7 @@ async function request(baseUrl, route, body, token) {
   return { status: response.status, body: await response.json() };
 }
 
-test('authenticated classroom roles, board writes, mic grants, and stream tickets are enforced', { timeout: 30_000 }, async t => {
-  const { generateKeyPair, exportJWK, SignJWT } = await import('jose');
-  const { privateKey, publicKey } = await generateKeyPair('EdDSA');
-  const keyId = 'smart-blackboard-test-key';
-  const publicJwk = { ...await exportJWK(publicKey), alg: 'EdDSA', kid: keyId, use: 'sig' };
-  const jwksPort = await reservePort();
-  const jwksServer = createServer((req, res) => {
-    if (req.url !== '/auth/.well-known/jwks.json') { res.writeHead(404); return res.end(); }
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'public, max-age=60' });
-    res.end(JSON.stringify({ keys: [publicJwk] }));
-  });
-  await new Promise((resolve, reject) => {
-    jwksServer.once('error', reject);
-    jwksServer.listen(jwksPort, '127.0.0.1', resolve);
-  });
-
+test('guest room sessions enforce teacher ownership, student board access, mic grants, and live stream tickets', { timeout: 30_000 }, async t => {
   const port = await reservePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'smart-blackboard-test-'));
@@ -71,7 +55,7 @@ test('authenticated classroom roles, board writes, mic grants, and stream ticket
       NODE_ENV: 'test',
       PORT: String(port),
       DATA_FILE: path.join(dataDir, 'rooms.json'),
-      NEON_AUTH_BASE_URL: `http://127.0.0.1:${jwksPort}/auth`
+      ROOM_SESSION_SECRET: 'test-room-session-secret-at-least-thirty-two-characters'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -85,22 +69,8 @@ test('authenticated classroom roles, board writes, mic grants, and stream ticket
       child.kill('SIGTERM');
       await exited;
     }
-    if (jwksServer.listening) await new Promise(resolve => jwksServer.close(resolve));
     rmSync(dataDir, { recursive: true, force: true });
   });
-
-  const tokenFor = userId => new SignJWT({ role: 'authenticated', email: `${userId}@example.test` })
-    .setProtectedHeader({ alg: 'EdDSA', kid: keyId })
-    .setSubject(userId)
-    .setIssuedAt()
-    .setExpirationTime('5m')
-    .sign(privateKey);
-  const teacherId = randomUUID();
-  const firstStudentUserId = randomUUID();
-  const secondStudentUserId = randomUUID();
-  const [teacherToken, firstStudentToken, secondStudentToken] = await Promise.all([
-    tokenFor(teacherId), tokenFor(firstStudentUserId), tokenFor(secondStudentUserId)
-  ]);
 
   await waitForHealth(baseUrl, child);
   const health = await fetch(`${baseUrl}/api/health`);
@@ -110,25 +80,38 @@ test('authenticated classroom roles, board writes, mic grants, and stream ticket
   assert.equal(health.headers.get('strict-transport-security'), 'max-age=63072000');
   assert.equal(health.headers.get('permissions-policy'), 'camera=(), microphone=(), geolocation=()');
 
-  assert.equal((await request(baseUrl, '/api/rooms', { name: 'Unauthenticated class' })).status, 401);
-  const created = await request(baseUrl, '/api/rooms', { name: 'Test class', memberName: 'Teacher' }, teacherToken);
+  assert.equal((await request(baseUrl, '/api/rooms', { name: '   ' })).status, 400);
+  const created = await request(baseUrl, '/api/rooms', { name: 'Test class', memberName: 'Teacher' });
   assert.equal(created.status, 201);
   const { code } = created.body.room;
   const teacherMemberId = created.body.memberId;
+  assert.equal((await request(baseUrl, `/api/rooms/${code}/act`, { memberId: teacherMemberId, type: 'room.rename', name: 'No session' })).status, 401);
+  assert.equal((await request(baseUrl, `/api/rooms/${code}A/act`, { memberId: teacherMemberId, type: 'room.rename', name: 'Other room' }, created.body.sessionToken)).status, 403, 'a private session cannot cross room boundaries');
+  const teacherToken = created.body.sessionToken;
+  assert.equal(typeof teacherToken, 'string', 'room creation returns a private teacher session');
+  const restoredTeacher = await request(baseUrl, '/api/rooms/join', { code, name: 'Teacher' }, teacherToken);
+  assert.equal(restoredTeacher.status, 200);
+  assert.equal(restoredTeacher.body.room.you.isOwner, true, 'the private host session restores teacher access');
 
-  const firstJoin = await request(baseUrl, '/api/rooms/join', { code, name: 'Student One', role: 'teacher' }, firstStudentToken);
-  const secondJoin = await request(baseUrl, '/api/rooms/join', { code, name: 'Student Two', role: 'student' }, secondStudentToken);
+  const firstJoin = await request(baseUrl, '/api/rooms/join', { code, name: 'Student One', role: 'teacher' });
+  const secondJoin = await request(baseUrl, '/api/rooms/join', { code, name: 'Student Two', role: 'student' });
   assert.equal(firstJoin.status, 200);
   assert.equal(secondJoin.status, 200);
-  assert.equal(firstJoin.body.room.you.role, 'student', 'client role input cannot elevate a participant');
+  assert.equal(firstJoin.body.room.you.role, 'student', 'a room code never grants teacher authority');
   const firstStudentId = firstJoin.body.memberId;
   const secondStudentId = secondJoin.body.memberId;
+  const firstStudentToken = firstJoin.body.sessionToken;
+  const secondStudentToken = secondJoin.body.sessionToken;
 
   const boardWrite = await request(baseUrl, `/api/rooms/${code}/board`, {
     memberId: firstStudentId,
     page: { items: [] }
   }, firstStudentToken);
   assert.equal(boardWrite.status, 403, 'students cannot mutate the teacher board');
+  assert.equal((await request(baseUrl, `/api/rooms/${code}/board`, {
+    memberId: teacherMemberId,
+    page: { type: 'black', w: 1280, h: 720, grid: 'none', pageNo: 1, items: [{ type: 'text', text: 'Live lesson' }] }
+  }, teacherToken)).status, 200, 'the teacher can publish the authoritative board snapshot');
 
   assert.equal((await request(baseUrl, `/api/rooms/${code}/act`, { memberId: firstStudentId, type: 'hand.raise' }, firstStudentToken)).status, 200);
   assert.equal((await request(baseUrl, `/api/rooms/${code}/act`, { memberId: firstStudentId, type: 'hand.approve', target: secondStudentId }, firstStudentToken)).status, 403);
@@ -153,13 +136,22 @@ test('authenticated classroom roles, board writes, mic grants, and stream ticket
 
   const stream = await fetch(`${baseUrl}/api/rooms/${code}/stream?t=${encodeURIComponent(ticketResponse.body.ticket)}`);
   assert.equal(stream.status, 200);
+  const streamReader = stream.body.getReader();
+  let liveEvents = '';
+  while (!liveEvents.includes('event: board')) {
+    const { done, value } = await streamReader.read();
+    if (done) break;
+    liveEvents += new TextDecoder().decode(value);
+  }
+  assert.match(liveEvents, /event: board/);
+  assert.match(liveEvents, /Live lesson/);
   const replayedTicket = await fetch(`${baseUrl}/api/rooms/${code}/stream?t=${encodeURIComponent(ticketResponse.body.ticket)}`);
   assert.equal(replayedTicket.status, 403, 'stream tickets are one-time use');
 
   const whileConnected = await request(baseUrl, '/api/rooms/join', { code, name: 'Student Two', role: 'student', memberId: secondStudentId }, secondStudentToken);
   assert.equal(whileConnected.body.room.mic.grant.state, 'approved_waiting', 'opening the event stream must not revoke a grant');
 
-  await stream.body.cancel();
+  await streamReader.cancel();
   const deadline = Date.now() + 3_000;
   let disconnected;
   while (Date.now() < deadline) {
